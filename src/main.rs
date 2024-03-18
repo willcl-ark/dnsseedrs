@@ -16,6 +16,7 @@ use domain::base::iana::rtype::Rtype;
 use domain::rdata::rfc1035::A;
 use domain::rdata::aaaa::Aaaa;
 use clap::Parser;
+use parking_lot::RwLock;
 use sha3::{Digest, Sha3_256};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -162,7 +163,7 @@ struct CrawlInfo {
     age: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct NetStatus {
     chain: Network,
     ipv4: bool,
@@ -308,55 +309,61 @@ fn socks5_connect(sock: &TcpStream, destination: &String, port: u16) -> Result<(
     return Ok(());
 }
 
-fn crawl_node(send_channel: SyncSender<CrawledNode>, node: NodeInfo, net_status: NetStatus) {
+fn crawl_node(send_channel: SyncSender<CrawledNode>, node: NodeInfo, net_status: Arc<RwLock<NetStatus>>) {
     println!("Crawling {}", &node.addr.to_string());
 
     let tried_timestamp = time::SystemTime::now().duration_since(time::UNIX_EPOCH).unwrap().as_secs();
     let age = tried_timestamp - node.last_tried;
+    let sock_res: Result<TcpStream, _>;
+    let net_magic;
 
-    let sock_res = match node.addr.host {
-        Host::Ipv4(ip) if net_status.ipv4 => {
-            TcpStream::connect_timeout(&SocketAddr::new(IpAddr::V4(ip), node.addr.port), time::Duration::from_secs(10))
-        },
-        Host::Ipv6(ip) if net_status.ipv6 => {
-            TcpStream::connect_timeout(&SocketAddr::new(IpAddr::V6(ip), node.addr.port), time::Duration::from_secs(10))
-        },
-        Host::CJDNS(ip) if net_status.cjdns => {
-            TcpStream::connect_timeout(&SocketAddr::new(IpAddr::V6(ip), node.addr.port), time::Duration::from_secs(10))
-        },
-        Host::OnionV3(ref host) if net_status.onion_proxy.is_some() => {
-            let proxy_addr = net_status.onion_proxy.as_ref().unwrap();
-            let stream = TcpStream::connect_timeout(&SocketAddr::from_str(&proxy_addr).unwrap(), time::Duration::from_secs(10));
-            if stream.is_ok() {
-                let cr = socks5_connect(&stream.as_ref().unwrap(), &host, node.addr.port);
-                match cr {
-                    Ok(..) => stream,
-                    Err(e) => Err(std::io::Error::other(e)),
+    {
+        let ns_read = net_status.read();
+        net_magic = ns_read.chain.magic();
+        sock_res = match node.addr.host {
+            Host::Ipv4(ip) if ns_read.ipv4 => {
+                TcpStream::connect_timeout(&SocketAddr::new(IpAddr::V4(ip), node.addr.port), time::Duration::from_secs(10))
+            },
+            Host::Ipv6(ip) if ns_read.ipv6 => {
+                TcpStream::connect_timeout(&SocketAddr::new(IpAddr::V6(ip), node.addr.port), time::Duration::from_secs(10))
+            },
+            Host::CJDNS(ip) if ns_read.cjdns => {
+                TcpStream::connect_timeout(&SocketAddr::new(IpAddr::V6(ip), node.addr.port), time::Duration::from_secs(10))
+            },
+            Host::OnionV3(ref host) if ns_read.onion_proxy.is_some() => {
+                let proxy_addr = ns_read.onion_proxy.as_ref().unwrap();
+                let stream = TcpStream::connect_timeout(&SocketAddr::from_str(proxy_addr).unwrap(), time::Duration::from_secs(10));
+                if stream.is_ok() {
+                    let cr = socks5_connect(stream.as_ref().unwrap(), host, node.addr.port);
+                    match cr {
+                        Ok(..) => stream,
+                        Err(e) => Err(std::io::Error::other(e)),
+                    }
+                } else {
+                    stream
                 }
-            } else {
-                stream
-            }
-        },
-        Host::I2P(ref host) if net_status.i2p_proxy.is_some() => {
-            let proxy_addr = net_status.i2p_proxy.as_ref().unwrap();
-            let stream = TcpStream::connect_timeout(&SocketAddr::from_str(&proxy_addr).unwrap(), time::Duration::from_secs(10));
-            if stream.is_err() {
-                let cr = socks5_connect(&stream.as_ref().unwrap(), &host, node.addr.port);
-                match cr {
-                    Ok(..) => stream,
-                    Err(e) => Err(std::io::Error::other(e)),
+            },
+            Host::I2P(ref host) if ns_read.i2p_proxy.is_some() => {
+                let proxy_addr = ns_read.i2p_proxy.as_ref().unwrap();
+                let stream = TcpStream::connect_timeout(&SocketAddr::from_str(proxy_addr).unwrap(), time::Duration::from_secs(10));
+                if stream.is_err() {
+                    let cr = socks5_connect(stream.as_ref().unwrap(), host, node.addr.port);
+                    match cr {
+                        Ok(..) => stream,
+                        Err(e) => Err(std::io::Error::other(e)),
+                    }
+                } else {
+                    stream
                 }
-            } else {
-                stream
-            }
-        },
-        _ => Err(std::io::Error::other("Net not available"))
+            },
+            _ => Err(std::io::Error::other("Net not available"))
+        };
     };
     if sock_res.is_err() {
         let mut node_info = node.clone();
         node_info.last_tried = tried_timestamp;
-        send_channel.send(CrawledNode::Failed(CrawlInfo{node_info: node_info, age: age})).unwrap();
-        return ();
+        send_channel.send(CrawledNode::Failed(CrawlInfo{node_info, age})).unwrap();
+        return;
     }
     let sock = sock_res.unwrap();
 
@@ -364,8 +371,6 @@ fn crawl_node(send_channel: SyncSender<CrawledNode>, node: NodeInfo, net_status:
     let ret: Result<(), std::io::Error> = (|| {
         let mut write_stream = BufWriter::new(&sock);
         let mut read_stream = BufReader::new(&sock);
-
-        let net_magic = net_status.chain.magic();
 
         // Prep Version message
         let addr_them = match &node.addr.host {
@@ -582,7 +587,7 @@ fn is_good(node: &NodeInfo, chain: &Network) -> bool {
     return false;
 }
 
-fn crawler_thread(db_conn: Arc<Mutex<rusqlite::Connection>>, threads: usize, net_status: NetStatus) {
+fn crawler_thread(db_conn: Arc<Mutex<rusqlite::Connection>>, threads: usize, net_status: Arc<RwLock<NetStatus>>) {
     // Setup thread pool with one less than specified to account for this thread.
     let pool = ThreadPool::new(threads - 1);
 
@@ -730,7 +735,7 @@ fn crawler_thread(db_conn: Arc<Mutex<rusqlite::Connection>>, threads: usize, net
             arc_queue.push(node).unwrap();
 
             if pool.active_count() < pool.max_count() {
-                let net_status_c: NetStatus = net_status.clone();
+                let net_status_c: Arc<RwLock<NetStatus>> = net_status.clone();
                 let queue_c = arc_queue.clone();
                 let tx_c = tx.clone();
                 pool.execute(move || {
@@ -1077,41 +1082,73 @@ fn dns_thread(sock: UdpSocket, db_conn: Arc<Mutex<rusqlite::Connection>>, seed_n
     }
 }
 
-fn check_proxies(args: &Args) -> (Option<&String>, Option<&String>) {
+fn check_proxies(onion_proxy_arg: String, i2p_proxy_arg: String, net_status: Arc<RwLock<NetStatus>>) {
     println!("Checking onion proxy");
-    let mut onion_proxy = Some(&args.onion_proxy);
-    let onion_proxy_check = TcpStream::connect_timeout(&SocketAddr::from_str(&args.onion_proxy).unwrap(), time::Duration::from_secs(10));
-    if onion_proxy_check.is_ok() {
-        if socks5_connect(&onion_proxy_check.as_ref().unwrap(), &"duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion".to_string(), 80).is_err() {
-            onion_proxy = None;
+    let mut onion_proxy = if !onion_proxy_arg.is_empty() { Some(onion_proxy_arg) } else { None };
+    let mut i2p_proxy = if !i2p_proxy_arg.is_empty() { Some(i2p_proxy_arg) } else { None };
+
+    if let Some(ref proxy_address) = onion_proxy {
+        match SocketAddr::from_str(proxy_address) {
+            Ok(socket_address) => {
+                let onion_proxy_check = TcpStream::connect_timeout(&socket_address, time::Duration::from_secs(10));
+                if onion_proxy_check.is_ok() {
+                    println!("Onion proxy check succeeded");
+                    if let Ok(stream) = onion_proxy_check {
+                        let _ = stream.shutdown(Shutdown::Both); // Fine to ignore result of shutdown
+                    }
+                } else {
+                    println!("Onion proxy check failed");
+                    onion_proxy = None;
+                }
+            }
+            Err(_) => {
+                println!("Invalid onion proxy address format");
+                onion_proxy = None;
+            }
         }
-        onion_proxy_check.unwrap().shutdown(Shutdown::Both).unwrap();
     } else {
-        onion_proxy = None;
+        println!("Onion proxy is not configured");
     }
+
     match onion_proxy {
-        Some(..) => println!("Onion proxy good"),
+        Some(_) => println!("Onion proxy good"),
         None => println!("Onion proxy bad"),
     }
 
+    // Check I2P Proxy
     println!("Checking I2P proxy");
-    let mut i2p_proxy = Some(&args.i2p_proxy);
-    let i2p_proxy_check = TcpStream::connect_timeout(&SocketAddr::from_str(&args.i2p_proxy).unwrap(), time::Duration::from_secs(10));
-    if i2p_proxy_check.is_ok() {
-        if socks5_connect(&i2p_proxy_check.as_ref().unwrap(), &"gqt2klvr6r2hpdfxzt4bn2awwehsnc7l5w22fj3enbauxkhnzcoq.b32.i2p".to_string(), 80).is_err() {
-            i2p_proxy = None;
-            println!("I2P proxy couldn't connect to test server");
+    if let Some(ref proxy_address) = i2p_proxy {
+        match SocketAddr::from_str(proxy_address) {
+            Ok(socket_address) => {
+                let i2p_proxy_check = TcpStream::connect_timeout(&socket_address, time::Duration::from_secs(10));
+                if i2p_proxy_check.is_ok() {
+                    println!("I2P proxy check succeeded");
+                    if let Ok(stream) = i2p_proxy_check {
+                        let _ = stream.shutdown(Shutdown::Both);
+                    }
+                } else {
+                    println!("I2P proxy check failed");
+                    i2p_proxy = None;
+                }
+            }
+            Err(_) => {
+                println!("Invalid I2P proxy address format");
+                i2p_proxy = None;
+            }
         }
-        i2p_proxy_check.unwrap().shutdown(Shutdown::Both).unwrap();
     } else {
-        println!("I2P proxy didn't connect");
-        i2p_proxy = None;
+        println!("I2P proxy is not configured");
     }
+
     match i2p_proxy {
-        Some(..) => println!("I2P proxy good"),
+        Some(_) => println!("I2P proxy good"),
         None => println!("I2P proxy bad"),
-    };
-    (onion_proxy, i2p_proxy)
+    }
+
+    let mut ns_write = net_status.write();
+    ns_write.onion_proxy = onion_proxy;
+    ns_write.i2p_proxy = i2p_proxy;
+    println!("Net status set to: {:?}", ns_write);
 }
 
 fn main() {
@@ -1127,21 +1164,22 @@ fn main() {
     }
     let chain = chain_p.unwrap();
 
-    // Initial proxy check
-    let (onion_proxy, i2p_proxy) = check_proxies(&args);
+    let net_status = Arc::new(RwLock::new(NetStatus {
+        chain,
+        ipv4: args.ipv4_reachable,
+        ipv6: args.ipv4_reachable,
+        cjdns: args.cjdns_reachable,
+        onion_proxy: None,
+        i2p_proxy: None,
+    }));
+
+    // Do a proxy check before starting
+    check_proxies(args.onion_proxy.clone(), args.i2p_proxy.clone(), net_status.clone());
 
     // Bind socket
     let address = args.address.clone();
     let sock = UdpSocket::bind((address, args.port)).unwrap();
 
-    let net_status = NetStatus {
-        chain: chain.clone(),
-        ipv4: args.ipv4_reachable,
-        ipv6: args.ipv4_reachable,
-        cjdns: args.cjdns_reachable,
-        onion_proxy: onion_proxy.cloned(),
-        i2p_proxy: i2p_proxy.cloned(),
-    };
 
     let db_conn = Arc::new(Mutex::new(rusqlite::Connection::open(&args.db_file).unwrap()));
     {
@@ -1177,7 +1215,7 @@ fn main() {
 
     // Start crawler threads
     let db_conn_c = db_conn.clone();
-    let net_status_c: NetStatus = net_status.clone();
+    let net_status_c: Arc<RwLock<NetStatus>> = net_status.clone();
     let t_crawl = thread::spawn(move || {
         crawler_thread(db_conn_c, args.threads - 3, net_status_c);
     });
