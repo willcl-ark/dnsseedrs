@@ -1151,6 +1151,13 @@ fn check_proxies(onion_proxy_arg: String, i2p_proxy_arg: String, net_status: Arc
     println!("Net status set to: {:?}", ns_write);
 }
 
+fn proxy_thread(onion_proxy: String, i2p_proxy: String, net_status: Arc<RwLock<NetStatus>>) {
+    loop {
+        thread::sleep(time::Duration::from_secs(60 * 5));
+        check_proxies(onion_proxy.clone(), i2p_proxy.clone(), net_status.clone());
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -1232,9 +1239,14 @@ fn main() {
         dns_thread(sock, db_conn_c3, &args.server_name, &chain);
     });
 
+    // Start proxy monitoring thread
+    let t_proxy = thread::spawn(move || {
+        proxy_thread(args.onion_proxy.clone(), args.i2p_proxy.clone(), net_status.clone());
+    });
+
     // Watchdog, exit if any main thread has died
     loop {
-        if t_crawl.is_finished() || t_dump.is_finished() || t_dns.is_finished() {
+        if t_crawl.is_finished() || t_dump.is_finished() || t_dns.is_finished() || t_proxy.is_finished() {
             break;
         }
         thread::sleep(time::Duration::from_secs(60));
