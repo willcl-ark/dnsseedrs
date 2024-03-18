@@ -1077,20 +1077,7 @@ fn dns_thread(sock: UdpSocket, db_conn: Arc<Mutex<rusqlite::Connection>>, seed_n
     }
 }
 
-fn main() {
-    let args = Args::parse();
-
-    // Pick the network
-    let chain_p = Network::from_core_arg(&args.chain);
-    match chain_p {
-        Ok(Network::Bitcoin) | Ok(Network:: Testnet) | Ok(Network::Signet) => (),
-        _ => {
-            println!("Unsupported network type: {}", args.chain);
-        },
-    }
-    let chain = chain_p.unwrap();
-
-    // Check proxies
+fn check_proxies(args: &Args) -> (Option<&String>, Option<&String>) {
     println!("Checking onion proxy");
     let mut onion_proxy = Some(&args.onion_proxy);
     let onion_proxy_check = TcpStream::connect_timeout(&SocketAddr::from_str(&args.onion_proxy).unwrap(), time::Duration::from_secs(10));
@@ -1123,10 +1110,29 @@ fn main() {
     match i2p_proxy {
         Some(..) => println!("I2P proxy good"),
         None => println!("I2P proxy bad"),
+    };
+    (onion_proxy, i2p_proxy)
+}
+
+fn main() {
+    let args = Args::parse();
+
+    // Pick the network
+    let chain_p = Network::from_core_arg(&args.chain);
+    match chain_p {
+        Ok(Network::Bitcoin) | Ok(Network:: Testnet) | Ok(Network::Signet) => (),
+        _ => {
+            println!("Unsupported network type: {}", args.chain);
+        },
     }
+    let chain = chain_p.unwrap();
+
+    // Initial proxy check
+    let (onion_proxy, i2p_proxy) = check_proxies(&args);
 
     // Bind socket
-    let sock = UdpSocket::bind((args.address, args.port)).unwrap();
+    let address = args.address.clone();
+    let sock = UdpSocket::bind((address, args.port)).unwrap();
 
     let net_status = NetStatus {
         chain: chain.clone(),
