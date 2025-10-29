@@ -9,7 +9,15 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay, treefmt-nix }:
-    flake-utils.lib.eachDefaultSystem (system:
+    {
+      # Export the NixOS module
+      nixosModules.default = import ./nixos/module.nix;
+
+      # Overlay to provide dnsseedrs package
+      overlays.default = final: prev: {
+        dnsseedrs = self.packages.${final.system}.default;
+      };
+    } // flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs {
