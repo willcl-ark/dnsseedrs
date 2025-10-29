@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fs::{read_dir, File},
+    fs::{File, read_dir},
     io::{BufRead, BufReader},
     path::Path,
     str::FromStr,
@@ -9,14 +9,14 @@ use std::{
 use base64ct::{Base64, Encoding};
 use domain::{
     base::{
+        Record,
         iana::SecAlg,
         name::{Name, ToName},
-        Record,
     },
     rdata::{
         aaaa::Aaaa,
         dnssec::{Dnskey, Ds, Nsec, Rrsig, Timestamp},
-        rfc1035::{Ns, Soa, A},
+        rfc1035::{A, Ns, Soa},
     },
     sign::{
         key::SigningKey,
@@ -26,7 +26,7 @@ use domain::{
 use ring::{
     error::Unspecified,
     rand::SystemRandom,
-    signature::{EcdsaKeyPair, Ed25519KeyPair, Signature, ECDSA_P256_SHA256_FIXED_SIGNING},
+    signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, Ed25519KeyPair, Signature},
 };
 
 enum DnsKeyPair {

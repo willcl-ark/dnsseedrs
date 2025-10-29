@@ -1,4 +1,4 @@
-use crate::common::{is_good, NodeInfo};
+use crate::common::{NodeInfo, is_good};
 
 use std::{
     path::Path,
@@ -7,9 +7,9 @@ use std::{
 
 use async_compression::tokio::write::GzipEncoder;
 use bitcoin::network::Network;
-use tokio::fs::{rename, File};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::time::{sleep, Duration};
+use tokio::fs::{File, rename};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, Compression};
+use tokio::time::{Duration, sleep};
 
 pub async fn dumper_thread(
     db_conn: Arc<Mutex<rusqlite::Connection>>,

@@ -14,15 +14,15 @@ use base32ct::{Base32Unpadded, Encoding};
 use bip324::futures::Protocol as V2Protocol;
 use bip324::io::Payload;
 use bip324::serde::{
-    deserialize as V2Deserialize, serialize as V2Serialize, NetworkMessage as V2NetworkMessage,
+    NetworkMessage as V2NetworkMessage, deserialize as V2Deserialize, serialize as V2Serialize,
 };
 use bitcoin::{
     consensus::{Decodable, Encodable},
     p2p::{
-        address::{AddrV2, Address},
-        message::{NetworkMessage, RawNetworkMessage, MAX_MSG_SIZE},
-        message_network::VersionMessage,
         Magic, ServiceFlags,
+        address::{AddrV2, Address},
+        message::{MAX_MSG_SIZE, NetworkMessage, RawNetworkMessage},
+        message_network::VersionMessage,
     },
 };
 use rusqlite::params;

@@ -1,6 +1,6 @@
 use crate::asmap::interpret;
-use crate::common::{is_good, BindProtocol, Host, NodeInfo};
-use crate::dnssec::{parse_dns_keys_dir, DnsSigningKey, RecordsToSign};
+use crate::common::{BindProtocol, Host, NodeInfo, is_good};
+use crate::dnssec::{DnsSigningKey, RecordsToSign, parse_dns_keys_dir};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -13,18 +13,18 @@ use std::{
 use bitcoin::{network::Network, p2p::ServiceFlags};
 use domain::{
     base::{
-        iana::{rcode::Rcode, rtype::Rtype, Class, SecAlg},
+        CanonicalOrd, Question,
+        iana::{Class, SecAlg, rcode::Rcode, rtype::Rtype},
         message::Message,
         message_builder::MessageBuilder,
         name::{Name, ParsedName, RelativeName, ToName},
         record::{Record, Ttl},
         serial::Serial,
-        CanonicalOrd, Question,
     },
     rdata::{
         aaaa::Aaaa,
         dnssec::{Nsec, RtypeBitmap, RtypeBitmapBuilder},
-        rfc1035::{Ns, Soa, A},
+        rfc1035::{A, Ns, Soa},
     },
     sign::{key::SigningKey, records::FamilyName},
 };
