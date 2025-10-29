@@ -1,9 +1,71 @@
-{ config, lib, pkgs, ... }:
-
-with lib;
-
-let
+{ config
+, lib
+, pkgs
+, ...
+}:
+with lib; let
   cfg = config.services.dnsseedrs;
+  dnsCfg = config.services.dnsseedrs-dns;
+
+  # DNSSEC submodule
+  dnssecOptions = {
+    options = {
+      enable = mkEnableOption "DNSSEC signing for this instance";
+
+      autoGenerate = mkOption {
+        type = types.bool;
+        default = true;
+        description = "Automatically generate DNSSEC keys if they don't exist.";
+      };
+
+      algorithm = mkOption {
+        type = types.enum [ "ECDSAP256SHA256" "ED25519" ];
+        default = "ECDSAP256SHA256";
+        description = "DNSSEC key algorithm to use.";
+      };
+
+      keyDir = mkOption {
+        type = types.str;
+        default = "dnssec-keys";
+        description = "Directory for DNSSEC keys (relative to dataDir).";
+      };
+    };
+  };
+
+  # DNS proxy configuration
+  dnsProxyOptions = {
+    enable = mkEnableOption "DNS forwarding proxy for dnsseedrs instances";
+
+    implementation = mkOption {
+      type = types.enum [ "coredns" ];
+      default = "coredns";
+      description = "DNS server implementation to use for forwarding.";
+    };
+
+    port = mkOption {
+      type = types.port;
+      default = 53;
+      description = "Port to bind the DNS proxy to.";
+    };
+
+    upstreamResolvers = mkOption {
+      type = types.listOf types.str;
+      default = [ "1.1.1.1" "8.8.8.8" ];
+      description = "Upstream DNS resolvers for non-seed domains.";
+    };
+
+    openFirewall = mkOption {
+      type = types.bool;
+      default = false;
+      description = "Open firewall ports for the DNS proxy.";
+    };
+
+    bind = mkOption {
+      type = types.listOf types.str;
+      default = [ "0.0.0.0" "::" ];
+      description = "IP addresses to bind the DNS proxy to.";
+    };
+  };
 
   instanceOptions = { name, ... }: {
     options = {
@@ -119,33 +181,61 @@ let
         default = [ ];
         description = "Additional command-line arguments to pass to dnsseedrs.";
       };
+
+      dnssec = mkOption {
+        type = types.submodule dnssecOptions;
+        default = { };
+        description = "DNSSEC configuration.";
+      };
+
+      localPort = mkOption {
+        type = types.nullOr types.port;
+        default = null;
+        description = "Local port for this instance when using DNS proxy. Overrides bind addresses.";
+      };
     };
   };
 
   # Generate systemd service for an instance
   mkInstanceService = name: instanceCfg:
     let
-      args = [
-        "--chain"
-        "${name}"
-        "--db-file"
-        "${instanceCfg.dataDir}/${instanceCfg.dbFile}"
-        "--dump-file"
-        "${instanceCfg.dataDir}/${instanceCfg.dumpFile}"
-        "--threads"
-        (toString instanceCfg.threads)
-        "--onion-proxy"
-        instanceCfg.onionProxy
-        "--i2p-proxy"
-        instanceCfg.i2pProxy
-      ] ++ optionals instanceCfg.disableIPv4 [ "--no-ipv4" ]
-      ++ optionals instanceCfg.disableIPv6 [ "--no-ipv6" ]
-      ++ optionals instanceCfg.cjdnsReachable [ "--cjdns-reachable" ]
-      ++ concatMap (seed: [ "--seednode" seed ]) instanceCfg.seedNodes
-      ++ concatMap (bind: [ "--bind" bind ]) instanceCfg.bind
-      ++ optionals (instanceCfg.dnssecKeys != null) [ "--dnssec-keys" (toString instanceCfg.dnssecKeys) ]
-      ++ [ instanceCfg.seedDomain instanceCfg.serverName instanceCfg.soaRname ]
-      ++ instanceCfg.extraArgs;
+      # Determine bind addresses
+      bindAddresses =
+        if instanceCfg.localPort != null
+        then [ "udp://127.0.0.1:${toString instanceCfg.localPort}" "tcp://127.0.0.1:${toString instanceCfg.localPort}" ]
+        else instanceCfg.bind;
+
+      # DNSSEC keys path
+      dnssecKeysPath =
+        if instanceCfg.dnssec.enable
+        then "${instanceCfg.dataDir}/${instanceCfg.dnssec.keyDir}"
+        else if instanceCfg.dnssecKeys != null
+        then toString instanceCfg.dnssecKeys
+        else null;
+
+      args =
+        [
+          "--chain"
+          "${name}"
+          "--db-file"
+          "${instanceCfg.dataDir}/${instanceCfg.dbFile}"
+          "--dump-file"
+          "${instanceCfg.dataDir}/${instanceCfg.dumpFile}"
+          "--threads"
+          (toString instanceCfg.threads)
+          "--onion-proxy"
+          instanceCfg.onionProxy
+          "--i2p-proxy"
+          instanceCfg.i2pProxy
+        ]
+        ++ optionals instanceCfg.disableIPv4 [ "--no-ipv4" ]
+        ++ optionals instanceCfg.disableIPv6 [ "--no-ipv6" ]
+        ++ optionals instanceCfg.cjdnsReachable [ "--cjdns-reachable" ]
+        ++ concatMap (seed: [ "--seednode" seed ]) instanceCfg.seedNodes
+        ++ concatMap (bind: [ "--bind" bind ]) bindAddresses
+        ++ optionals (dnssecKeysPath != null) [ "--dnssec-keys" dnssecKeysPath ]
+        ++ [ instanceCfg.seedDomain instanceCfg.serverName instanceCfg.soaRname ]
+        ++ instanceCfg.extraArgs;
     in
     {
       description = "DNS seed server for Bitcoin ${name} network";
@@ -189,76 +279,173 @@ let
     };
 
   enabledInstances = filterAttrs (name: cfg: cfg.enable) cfg;
-
 in
 {
-  options.services.dnsseedrs = mkOption {
-    type = types.attrsOf (types.submodule instanceOptions);
-    default = { };
-    description = "dnsseedrs instances configuration.";
+  options = {
+    services.dnsseedrs = mkOption {
+      type = types.attrsOf (types.submodule instanceOptions);
+      default = { };
+      description = "dnsseedrs instances configuration.";
+    };
+
+    services.dnsseedrs-dns = mkOption {
+      type = types.submodule { options = dnsProxyOptions; };
+      default = { };
+      description = "DNS proxy configuration for dnsseedrs instances.";
+    };
   };
 
-  config = mkIf (enabledInstances != { }) {
-    # Create users and groups for each enabled instance
-    users.users = mapAttrs'
-      (name: instanceCfg:
-        nameValuePair instanceCfg.user {
-          isSystemUser = true;
-          group = instanceCfg.group;
-          home = instanceCfg.dataDir;
-          createHome = false;
-          description = "dnsseedrs ${name} user";
-        }
-      )
-      enabledInstances;
+  # DNSSEC key generation function
+  mkDnssecKeygenService = name: instanceCfg: {
+    description = "Generate DNSSEC keys for dnsseedrs ${name}";
+    before = [ "dnsseedrs-${name}.service" ];
+    wantedBy = [ "dnsseedrs-${name}.service" ];
 
-    users.groups = mapAttrs'
-      (name: instanceCfg:
-        nameValuePair instanceCfg.group { }
-      )
-      enabledInstances;
+    serviceConfig = {
+      Type = "oneshot";
+      User = instanceCfg.user;
+      Group = instanceCfg.group;
+      WorkingDirectory = instanceCfg.dataDir;
+      RemainAfterExit = true;
+    };
 
-    # Create systemd services for each enabled instance
-    systemd.services = mapAttrs'
-      (name: instanceCfg:
-        nameValuePair "dnsseedrs-${name}" (mkInstanceService name instanceCfg)
-      )
-      enabledInstances;
+    script =
+      let
+        keyDir = "${instanceCfg.dataDir}/${instanceCfg.dnssec.keyDir}";
+        algorithm =
+          if instanceCfg.dnssec.algorithm == "ECDSAP256SHA256"
+          then "13"
+          else "15";
+      in
+      ''
+        mkdir -p "${keyDir}"
+        cd "${keyDir}"
 
-    # Ensure data directories exist with correct permissions
-    systemd.tmpfiles.rules = flatten (mapAttrsToList
-      (name: instanceCfg: [
-        "d ${instanceCfg.dataDir} 0750 ${instanceCfg.user} ${instanceCfg.group} - -"
-      ])
-      enabledInstances);
-
-    # Open firewall ports if needed (commented out by default for security)
-    # networking.firewall.allowedTCPPorts = flatten (mapAttrsToList
-    #   (name: instanceCfg:
-    #     map
-    #       (bind:
-    #         let
-    #           parts = splitString ":" (removePrefix "tcp://" bind);
-    #           port = toInt (last parts);
-    #         in
-    #         port
-    #       )
-    #       (filter (hasPrefix "tcp://") instanceCfg.bind)
-    #   )
-    #   enabledInstances);
-    #
-    # networking.firewall.allowedUDPPorts = flatten (mapAttrsToList
-    #   (name: instanceCfg:
-    #     map
-    #       (bind:
-    #         let
-    #           parts = splitString ":" (removePrefix "udp://" bind);
-    #           port = toInt (last parts);
-    #         in
-    #         port
-    #       )
-    #       (filter (hasPrefix "udp://") instanceCfg.bind)
-    #   )
-    #   enabledInstances);
+        # Check if keys already exist
+        if ! ls K${instanceCfg.seedDomain}.+${algorithm}+*.key 2>/dev/null; then
+          echo "Generating DNSSEC keys for ${instanceCfg.seedDomain}..."
+          ${pkgs.bind}/bin/dnssec-keygen -a ${algorithm} -b 256 "${instanceCfg.seedDomain}"
+          echo "DNSSEC keys generated in ${keyDir}"
+          echo "Please configure your DNS provider with the following DS records:"
+          for keyfile in K${instanceCfg.seedDomain}.+${algorithm}+*.key; do
+            if [ -f "$keyfile" ]; then
+              ${pkgs.bind}/bin/dnssec-dsfromkey "$keyfile"
+            fi
+          done
+        else
+          echo "DNSSEC keys already exist for ${instanceCfg.seedDomain}"
+        fi
+      '';
   };
+
+  # CoreDNS configuration generator
+  mkCoreDnsConfig =
+    let
+      instanceForwardings = concatStringsSep "\n" (mapAttrsToList
+        (
+          name: instanceCfg:
+            let
+              port =
+                if instanceCfg.localPort != null
+                then instanceCfg.localPort
+                else 5353;
+            in
+            ''
+              ${instanceCfg.seedDomain}:${toString dnsCfg.port} {
+                  bind ${concatStringsSep " " dnsCfg.bind}
+                  forward . 127.0.0.1:${toString port}
+                  log
+              }
+            ''
+        )
+        enabledInstances);
+    in
+    ''
+      ${instanceForwardings}
+
+      .:${toString dnsCfg.port} {
+          bind ${concatStringsSep " " dnsCfg.bind}
+          forward . ${concatStringsSep " " dnsCfg.upstreamResolvers}
+          log
+      }
+    '';
+
+  config = mkMerge [
+    (mkIf (enabledInstances != { }) {
+      # Create users and groups for each enabled instance
+      users.users =
+        mapAttrs'
+          (
+            name: instanceCfg:
+              nameValuePair instanceCfg.user {
+                isSystemUser = true;
+                group = instanceCfg.group;
+                home = instanceCfg.dataDir;
+                createHome = false;
+                description = "dnsseedrs ${name} user";
+              }
+          )
+          enabledInstances;
+
+      users.groups =
+        mapAttrs'
+          (
+            name: instanceCfg:
+              nameValuePair instanceCfg.group { }
+          )
+          enabledInstances;
+
+      # Create systemd services for each enabled instance
+      systemd.services =
+        mapAttrs'
+          (
+            name: instanceCfg:
+              nameValuePair "dnsseedrs-${name}" (mkInstanceService name instanceCfg)
+          )
+          enabledInstances
+        // optionalAttrs (any (instanceCfg: instanceCfg.dnssec.enable && instanceCfg.dnssec.autoGenerate) (attrValues enabledInstances))
+          (mapAttrs'
+            (
+              name: instanceCfg:
+                nameValuePair "dnsseedrs-${name}-dnssec-keys" (mkDnssecKeygenService name instanceCfg)
+            )
+            (filterAttrs (name: instanceCfg: instanceCfg.dnssec.enable && instanceCfg.dnssec.autoGenerate) enabledInstances));
+
+      # Ensure data directories exist with correct permissions
+      systemd.tmpfiles.rules = flatten (mapAttrsToList
+        (name: instanceCfg:
+          [
+            "d ${instanceCfg.dataDir} 0750 ${instanceCfg.user} ${instanceCfg.group} - -"
+          ]
+          ++ optionals instanceCfg.dnssec.enable [
+            "d ${instanceCfg.dataDir}/${instanceCfg.dnssec.keyDir} 0750 ${instanceCfg.user} ${instanceCfg.group} - -"
+          ])
+        enabledInstances);
+    })
+
+    # DNS proxy service configuration
+    (mkIf dnsCfg.enable {
+      services.coredns = {
+        enable = true;
+        config = mkCoreDnsConfig;
+      };
+
+      # Open firewall ports for DNS proxy
+      networking.firewall = mkIf dnsCfg.openFirewall {
+        allowedTCPPorts = [ dnsCfg.port ];
+        allowedUDPPorts = [ dnsCfg.port ];
+      };
+
+      # Ensure CoreDNS package is available
+      environment.systemPackages = [ pkgs.coredns ];
+    })
+
+    # DNSSEC helper script
+    (mkIf (any (instanceCfg: instanceCfg.dnssec.enable) (attrValues enabledInstances)) {
+      environment.systemPackages = [
+        (pkgs.writeScriptBin "dnsseedrs-show-ds-records" (builtins.readFile ./show-ds-records.sh))
+        pkgs.bind # For dnssec-dsfromkey command
+      ];
+    })
+  ];
 }
