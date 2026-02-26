@@ -765,7 +765,7 @@ pub async fn crawler_thread(
         if let Ok(i2p_proxy_sock) = &mut i2p_proxy_check {
             if socks5_connect(
                 i2p_proxy_sock,
-                &"gqt2klvr6r2hpdfxzt4bn2awwehsnc7l5w22fj3enbauxkhnzcoq.b32.i2p".to_string(),
+                &"udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p".to_string(),
                 80,
             )
             .await
