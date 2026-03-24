@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bitcoin DNS Seeder Analysis</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      colors: {
+        od: {
+          bg:    '#0e1013',
+          bg0:   '#1f2329',
+          bg1:   '#282c34',
+          bg2:   '#30363f',
+          bg3:   '#323641',
+          fg:    '#a0a8b7',
+          grey:  '#535965',
+          lgrey: '#7a818e',
+          red:   '#e55561',
+          green: '#8ebd6b',
+          blue:  '#4fa6ed',
+          yellow:'#e2b86b',
+          purple:'#bf68d9',
+          cyan:  '#48b0bd',
+          orange:'#cc9057',
+        }
+      }
+    }
+  }
+}
+</script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+</head>
+<body class="bg-od-bg text-od-fg min-h-screen">
+
+<div class="max-w-7xl mx-auto px-4 py-8">
+  <h1 class="text-3xl font-bold text-center text-od-blue">Bitcoin DNS Seeder Analysis</h1>
+  <p class="text-center text-od-grey mt-1">
+    Data from <a href="https://bitcoin.fish.foo/" class="text-od-cyan hover:underline">bitcoin.fish.foo</a>
+    &mdash; <span id="generated-at"></span>
+  </p>
+
+  <div id="loading" class="text-center py-20 text-od-grey">Loading data&hellip;</div>
+  <div id="content" class="hidden space-y-8 mt-8">
+
+    <section id="classification" class="bg-od-bg1 rounded-lg p-6">
+      <h2 class="text-lg font-semibold mb-4"><a href="#classification" class="text-od-fg hover:text-od-blue">Known &amp; Good Nodes by Classification</a></h2>
+      <canvas id="chart-classification"></canvas>
+    </section>
+
+    <section id="distribution" class="bg-od-bg1 rounded-lg p-6">
+      <h2 class="text-lg font-semibold mb-4"><a href="#distribution" class="text-od-fg hover:text-od-blue">Node Distribution</a></h2>
+      <div class="grid grid-cols-2 gap-4">
+        <div><p class="text-center text-sm text-od-lgrey mb-2">Known Nodes</p><canvas id="chart-pie-known"></canvas></div>
+        <div><p class="text-center text-sm text-od-lgrey mb-2">Good Nodes</p><canvas id="chart-pie-good"></canvas></div>
+      </div>
+    </section>
+
+    <section id="top-ua" class="bg-od-bg1 rounded-lg p-6">
+      <h2 class="text-lg font-semibold mb-4"><a href="#top-ua" class="text-od-fg hover:text-od-blue">Top 25 User Agents (Good Nodes)</a></h2>
+      <div style="height: 600px"><canvas id="chart-top-ua"></canvas></div>
+    </section>
+
+    <section id="good-rate" class="bg-od-bg1 rounded-lg p-6">
+      <h2 class="text-lg font-semibold mb-4"><a href="#good-rate" class="text-od-fg hover:text-od-blue">Good Rate by Classification</a></h2>
+      <canvas id="chart-good-rate"></canvas>
+    </section>
+
+    <section id="kb-versions" class="bg-od-bg1 rounded-lg p-6">
+      <h2 class="text-lg font-semibold mb-4"><a href="#kb-versions" class="text-od-fg hover:text-od-blue">Knots &amp; BIP110 Version Distribution (Good)</a></h2>
+      <div style="height: 450px"><canvas id="chart-kb-versions"></canvas></div>
+    </section>
+
+    <section id="networks" class="bg-od-bg1 rounded-lg p-6">
+      <h2 class="text-lg font-semibold mb-4"><a href="#networks" class="text-od-fg hover:text-od-blue">Known &amp; Good Nodes by Network</a></h2>
+      <canvas id="chart-networks"></canvas>
+    </section>
+
+    <section id="net-good-rate" class="bg-od-bg1 rounded-lg p-6">
+      <h2 class="text-lg font-semibold mb-4"><a href="#net-good-rate" class="text-od-fg hover:text-od-blue">Good Rate by Network</a></h2>
+      <canvas id="chart-net-good-rate"></canvas>
+    </section>
+
+    <section id="net-class" class="bg-od-bg1 rounded-lg p-6">
+      <h2 class="text-lg font-semibold mb-4"><a href="#net-class" class="text-od-fg hover:text-od-blue">Good Nodes: Network &times; Classification</a></h2>
+      <canvas id="chart-net-class"></canvas>
+    </section>
+
+    <section id="sybil" class="bg-od-bg1 rounded-lg p-6">
+      <h2 class="text-lg font-semibold mb-4"><a href="#sybil" class="text-od-fg hover:text-od-blue">Probable Sybil Detection</a></h2>
+      <p class="text-od-lgrey mb-2">
+        Likely sybil nodes detected by grouping good IPv4 nodes into /16 prefixes and flagging any
+        prefix where node count exceeds <strong class="text-od-fg">mean + 5&sigma;</strong>
+        (<span id="sybil-stats"></span>).
+      </p>
+      <p class="text-od-lgrey mb-4">
+        Flagged <strong class="text-od-fg" id="sybil-prefix-count"></strong> prefixes containing
+        <strong class="text-od-fg" id="sybil-node-count"></strong> nodes:
+        <span id="sybil-prefix-list" class="text-od-grey"></span>
+      </p>
+      <canvas id="chart-sybil"></canvas>
+    </section>
+
+    <section id="net-class-sybil" class="bg-od-bg1 rounded-lg p-6">
+      <h2 class="text-lg font-semibold mb-4"><a href="#net-class-sybil" class="text-od-fg hover:text-od-blue">Good Nodes: Network &times; Classification (Sybil Filtered)</a></h2>
+      <canvas id="chart-net-class-sybil"></canvas>
+    </section>
+
+    <section id="top-prefixes" class="bg-od-bg1 rounded-lg p-6">
+      <h2 class="text-lg font-semibold mb-4"><a href="#top-prefixes" class="text-od-fg hover:text-od-blue">Top 20 /16 Prefixes by Good Node Count</a></h2>
+      <div style="height: 550px"><canvas id="chart-top-prefixes"></canvas></div>
+    </section>
+
+    <section id="prefix-table" class="bg-od-bg1 rounded-lg p-6">
+      <h2 class="text-lg font-semibold mb-4"><a href="#prefix-table" class="text-od-fg hover:text-od-blue">IPv4 /16 Prefix Concentration (Good Nodes)</a></h2>
+      <p class="text-od-grey text-sm mb-3" id="prefix-stats"></p>
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead><tr class="text-od-cyan border-b border-od-bg2">
+            <th class="text-left py-2 px-3">Prefix</th>
+            <th class="text-right py-2 px-3">Total</th>
+            <th class="text-right py-2 px-3">Core</th>
+            <th class="text-right py-2 px-3">Knots</th>
+            <th class="text-right py-2 px-3">BIP110</th>
+            <th class="text-right py-2 px-3">Other</th>
+          </tr></thead>
+          <tbody id="prefix-table-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="overview" class="bg-od-bg1 rounded-lg p-6">
+      <h2 class="text-lg font-semibold mb-4"><a href="#overview" class="text-od-fg hover:text-od-blue">All Nodes in Database (Including Never Contacted)</a></h2>
+      <div class="max-w-md mx-auto"><canvas id="chart-overview"></canvas></div>
+    </section>
+
+    <section id="custom-ua" class="bg-od-bg1 rounded-lg p-6">
+      <h2 class="text-lg font-semibold mb-4"><a href="#custom-ua" class="text-od-fg hover:text-od-blue">Custom User Agents (count &gt; 1)</a></h2>
+      <p class="text-od-grey text-sm mb-3" id="custom-ua-stats"></p>
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead><tr class="text-od-cyan border-b border-od-bg2">
+            <th class="text-left py-2 px-3">User Agent</th>
+            <th class="text-right py-2 px-3">Count</th>
+          </tr></thead>
+          <tbody id="custom-ua-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+  </div>
+</div>
+
+<script>
+Chart.defaults.color = '#a0a8b7';
+Chart.defaults.font.family = 'ui-monospace, monospace';
+
+const GRID = '#30363f';
+
+const C = {
+  core:         '#4fa6ed',
+  knots:        '#cc9057',
+  bip110:       '#e55561',
+  other:        '#535965',
+  unknown:      '#323641',
+  known:        '#e2b86b',
+  good:         '#8ebd6b',
+  ipv4:         '#48b0bd',
+  ipv6:         '#e2b86b',
+  tor:          '#bf68d9',
+  // sybil variants — visually distinct from parent
+  core_sybil:   '#266269',
+  knots_sybil:  '#835d1a',
+  bip110_sybil: '#8b3434',
+  other_sybil:  '#323641',
+};
+
+function col(key) { return C[key] || '#535965'; }
+function colKeys(keys) { return keys.map(col); }
+
+function colorForUa(label) {
+  const ll = label.toLowerCase();
+  if (ll.includes('bip110')) return C.bip110;
+  if (ll.includes('knots')) return C.knots;
+  return C.core;
+}
+
+function barChart(id, labels, datasets, opts = {}) {
+  return new Chart(document.getElementById(id), {
+    type: 'bar',
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: opts.maintainAspectRatio !== false,
+      indexAxis: opts.horizontal ? 'y' : 'x',
+      scales: {
+        x: { stacked: opts.stacked, grid: { color: GRID }, max: opts.maxX },
+        y: { stacked: opts.stacked, grid: { color: GRID }, max: opts.maxY },
+      },
+      plugins: { legend: { display: datasets.length > 1 } },
+    },
+  });
+}
+
+function pieChart(id, labels, values, colors) {
+  return new Chart(document.getElementById(id), {
+    type: 'doughnut',
+    data: {
+      labels,
+      datasets: [{ data: values, backgroundColor: colors, borderWidth: 0 }],
+    },
+    options: { responsive: true, plugins: { legend: { position: 'bottom' } } },
+  });
+}
+
+function fmt(n) { return n.toLocaleString(); }
+
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+async function main() {
+  const resp = await fetch('data.json').catch(e => {
+    document.getElementById('loading').textContent = 'Failed to load data.json: ' + e.message;
+    throw e;
+  });
+  if (!resp.ok) {
+    document.getElementById('loading').textContent = 'Failed to load data.json: ' + resp.status;
+    return;
+  }
+  const D = await resp.json();
+
+  document.getElementById('generated-at').textContent =
+    new Date(D.generated_at).toLocaleString();
+  document.getElementById('loading').classList.add('hidden');
+  document.getElementById('content').classList.remove('hidden');
+
+  const c = D.classification;
+  const classColors = colKeys(c.keys);
+
+  // Classification bar
+  barChart('chart-classification', c.labels, [
+    { label: 'Known', data: c.known, backgroundColor: C.known },
+    { label: 'Good', data: c.good, backgroundColor: C.good },
+  ]);
+
+  // Pies
+  pieChart('chart-pie-known', c.labels, c.known, classColors);
+  pieChart('chart-pie-good', c.labels, c.good, classColors);
+
+  // Top user agents
+  const ua = D.top_user_agents;
+  barChart('chart-top-ua', ua.labels, [{
+    data: ua.counts,
+    backgroundColor: ua.labels.map(colorForUa),
+  }], { horizontal: true, maintainAspectRatio: false });
+
+  // Good rate
+  barChart('chart-good-rate', c.labels, [{
+    data: c.good_rates, backgroundColor: classColors,
+  }], { maxY: 100 });
+
+  // Knots/BIP110 versions
+  const kb = D.knots_bip110_versions;
+  barChart('chart-kb-versions', kb.labels, [{
+    data: kb.counts,
+    backgroundColor: kb.labels.map(colorForUa),
+  }], { horizontal: true, maintainAspectRatio: false });
+
+  // Networks
+  const n = D.networks;
+  barChart('chart-networks', n.labels, [
+    { label: 'Known', data: n.known, backgroundColor: C.known },
+    { label: 'Good', data: n.good, backgroundColor: C.good },
+  ]);
+
+  // Network good rate
+  barChart('chart-net-good-rate', n.labels, [{
+    data: n.good_rates, backgroundColor: colKeys(n.keys),
+  }], { maxY: 100 });
+
+  // Network x Classification
+  const nc = D.network_classification;
+  barChart('chart-net-class', nc.net_labels,
+    nc.series.map(s => ({ label: s.name, data: s.values, backgroundColor: col(s.key) })),
+    { stacked: true });
+
+  // Sybil
+  const sy = D.sybil;
+  document.getElementById('sybil-stats').textContent =
+    `mean=${sy.mean}, σ=${sy.stddev}, threshold=${sy.threshold}`;
+  document.getElementById('sybil-prefix-count').textContent = sy.prefixes.length;
+  document.getElementById('sybil-node-count').textContent = fmt(sy.count);
+  document.getElementById('sybil-prefix-list').textContent = sy.prefixes.join(', ');
+
+  barChart('chart-sybil', sy.bars.map(b => b.label), [{
+    data: sy.bars.map(b => b.value),
+    backgroundColor: sy.bars.map(b => col(b.key)),
+  }]);
+
+  // Network x Classification (sybil)
+  const ncs = D.network_classification_sybil;
+  barChart('chart-net-class-sybil', ncs.net_labels,
+    ncs.series.map(s => ({ label: s.name, data: s.values, backgroundColor: col(s.key) })),
+    { stacked: true });
+
+  // Top prefixes
+  const tp = D.top_prefixes;
+  barChart('chart-top-prefixes', tp.labels,
+    tp.series.map(s => ({ label: s.name, data: s.values, backgroundColor: col(s.key) })),
+    { horizontal: true, stacked: true, maintainAspectRatio: false });
+
+  // Prefix table
+  const pt = D.prefix_table;
+  const sc = pt.stats.sybil_by_class;
+  document.getElementById('prefix-stats').innerHTML =
+    `${fmt(pt.stats.distinct_prefixes)} distinct /16 prefixes across ${fmt(pt.stats.total_good_ipv4)} good IPv4 nodes<br>` +
+    `${pt.stats.sybil_prefix_count} probable sybil prefixes hold:<br>` +
+    `&nbsp;&nbsp;${sc.core.pct}% of Core nodes (${fmt(sc.core.sybil)}/${fmt(sc.core.total)})<br>` +
+    `&nbsp;&nbsp;${sc.knots.pct}% of Knots nodes (${fmt(sc.knots.sybil)}/${fmt(sc.knots.total)})<br>` +
+    `&nbsp;&nbsp;${sc.bip110.pct}% of BIP110 nodes (${fmt(sc.bip110.sybil)}/${fmt(sc.bip110.total)})`;
+  document.getElementById('prefix-table-body').innerHTML = pt.rows.map(r =>
+    `<tr class="border-b border-od-bg2">
+      <td class="py-2 px-3 font-mono">${escapeHtml(r.prefix)}</td>
+      <td class="text-right py-2 px-3">${fmt(r.total)}</td>
+      <td class="text-right py-2 px-3">${fmt(r.core)}</td>
+      <td class="text-right py-2 px-3">${fmt(r.knots)}</td>
+      <td class="text-right py-2 px-3">${fmt(r.bip110)}</td>
+      <td class="text-right py-2 px-3">${fmt(r.other)}</td>
+    </tr>`
+  ).join('');
+
+  // Overview pie
+  const ov = D.overview_pie;
+  pieChart('chart-overview', ov.labels, ov.values, colKeys(ov.keys));
+
+  // Custom user agents
+  const cu = D.custom_user_agents;
+  document.getElementById('custom-ua-stats').textContent =
+    `${fmt(cu.total)} total nodes with non-standard user agents (${cu.distinct} distinct, ${cu.items.length} with count > 1)`;
+  document.getElementById('custom-ua-body').innerHTML = cu.items.map(r =>
+    `<tr class="border-b border-od-bg2">
+      <td class="py-2 px-3 font-mono">${escapeHtml(r.ua)}</td>
+      <td class="text-right py-2 px-3">${fmt(r.count)}</td>
+    </tr>`
+  ).join('');
+}
+
+main();
+</script>
+</body>
+</html>

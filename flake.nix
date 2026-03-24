@@ -26,7 +26,7 @@
             pkgs.cargo
             pkgs.rustc
             pkgs.rustfmt
-            pkgs.rust-analyzer ];
+            pkgs.rust-analyzer (pkgs.python313.withPackages (ps: [ ps.plotly ])) ];
         };
       }
     )
