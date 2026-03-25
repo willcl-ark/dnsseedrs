@@ -22,7 +22,11 @@
         packages.default = dnsseedrs;
         devShells.default = pkgs.mkShell {
           inputsFrom = [ dnsseedrs ];
-          packages = [ pkgs.rust-analyzer ];
+          packages = [
+            pkgs.cargo
+            pkgs.rustc
+            pkgs.rustfmt
+            pkgs.rust-analyzer ];
         };
       }
     )

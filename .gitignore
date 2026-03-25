@@ -4,3 +4,4 @@
 **/K*.key
 **/K*.private
 /result
+.envrc
