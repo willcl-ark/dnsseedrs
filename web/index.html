@@ -92,7 +92,7 @@ tailwind.config = {
     <section id="sybil" class="bg-od-bg1 rounded-lg p-6">
       <h2 class="text-lg font-semibold mb-4"><a href="#sybil" class="text-od-fg hover:text-od-blue">Probable Sybil Detection</a></h2>
       <p class="text-od-lgrey mb-2">
-        Likely sybil nodes detected by grouping good IPv4 nodes into /16 prefixes and flagging any
+        Likely sybil nodes detected by grouping good nodes into IPv4 /24 and IPv6 /48 prefixes and flagging any
         prefix where node count exceeds <strong class="text-od-fg">mean + 5&sigma;</strong>
         (<span id="sybil-stats"></span>).
       </p>
@@ -110,12 +110,12 @@ tailwind.config = {
     </section>
 
     <section id="top-prefixes" class="bg-od-bg1 rounded-lg p-6">
-      <h2 class="text-lg font-semibold mb-4"><a href="#top-prefixes" class="text-od-fg hover:text-od-blue">Top 20 /16 Prefixes by Good Node Count</a></h2>
+      <h2 class="text-lg font-semibold mb-4"><a href="#top-prefixes" class="text-od-fg hover:text-od-blue">Top 20 Prefixes by Good Node Count</a></h2>
       <div style="height: 550px"><canvas id="chart-top-prefixes"></canvas></div>
     </section>
 
     <section id="prefix-table" class="bg-od-bg1 rounded-lg p-6">
-      <h2 class="text-lg font-semibold mb-4"><a href="#prefix-table" class="text-od-fg hover:text-od-blue">IPv4 /16 Prefix Concentration (Good Nodes)</a></h2>
+      <h2 class="text-lg font-semibold mb-4"><a href="#prefix-table" class="text-od-fg hover:text-od-blue">IP Prefix Concentration (Good Nodes)</a></h2>
       <p class="text-od-grey text-sm mb-3" id="prefix-stats"></p>
       <div class="overflow-x-auto">
         <table class="w-full text-sm">
@@ -319,7 +319,7 @@ async function main() {
   const pt = D.prefix_table;
   const sc = pt.stats.sybil_by_class;
   document.getElementById('prefix-stats').innerHTML =
-    `${fmt(pt.stats.distinct_prefixes)} distinct /16 prefixes across ${fmt(pt.stats.total_good_ipv4)} good IPv4 nodes<br>` +
+    `${fmt(pt.stats.distinct_prefixes)} distinct prefixes across ${fmt(pt.stats.total_good_routable)} good routable nodes<br>` +
     `${pt.stats.sybil_prefix_count} probable sybil prefixes hold:<br>` +
     `&nbsp;&nbsp;${sc.core.pct}% of Core nodes (${fmt(sc.core.sybil)}/${fmt(sc.core.total)})<br>` +
     `&nbsp;&nbsp;${sc.knots.pct}% of Knots nodes (${fmt(sc.knots.sybil)}/${fmt(sc.knots.total)})<br>` +

@@ -9,6 +9,7 @@ import argparse
 import gzip
 import json
 import os
+import ipaddress
 import re
 import urllib.request
 from collections import Counter
@@ -58,13 +59,20 @@ def parse_seeds(path: str) -> list[dict]:
     return rows
 
 
-def extract_prefix16(addr: str) -> str | None:
-    if ".onion:" in addr or addr.startswith("["):
+def extract_prefix(addr: str) -> str | None:
+    if ".onion:" in addr:
         return None
-    parts = addr.split(".")
-    if len(parts) >= 2:
-        return f"{parts[0]}.{parts[1]}"
-    return None
+    if addr.startswith("["):
+        host = addr.split("]")[0][1:]
+        try:
+            return str(ipaddress.ip_network(host + "/48", strict=False))
+        except ValueError:
+            return None
+    host = addr.split(":")[0]
+    try:
+        return str(ipaddress.ip_network(host + "/24", strict=False))
+    except ValueError:
+        return None
 
 
 def classify_network(addr: str) -> str:
@@ -190,10 +198,10 @@ def build_data(rows: list[dict]) -> dict:
             "values": [cross_good[n][cls] for n in networks],
         })
 
-    # IPv4 /16 prefix clustering
+    # IP prefix clustering (IPv4 /24, IPv6 /48)
     prefix_by_class = {}
     for r in good_rows:
-        prefix = extract_prefix16(r["address"])
+        prefix = extract_prefix(r["address"])
         if prefix is None:
             continue
         cls = classify_agent(r["user_agent"])
@@ -212,7 +220,7 @@ def build_data(rows: list[dict]) -> dict:
     sybil_prefixes = sorted(p for p, total in prefix_totals.items() if total > sybil_threshold)
 
     def is_sybil(addr: str) -> bool:
-        prefix = extract_prefix16(addr)
+        prefix = extract_prefix(addr)
         return prefix is not None and prefix in sybil_prefixes
 
     sybil_count = sum(1 for r in good_rows if is_sybil(r["address"]))
@@ -224,15 +232,15 @@ def build_data(rows: list[dict]) -> dict:
     print(f"\nSybil: mean={mean:.1f}, σ={stddev:.1f}, threshold={sybil_threshold:.0f}")
     print(f"  Flagged {len(sybil_prefixes)} prefixes, {sybil_count:,} nodes")
 
-    # Sybil breakdown (IPv4 only — sybil detection is IPv4-specific)
-    ipv4_good_by_cls = Counter()
+    # Sybil breakdown (IPv4 + IPv6, excludes Tor)
+    routable_good_by_cls = Counter()
     for counts_by_cls in prefix_by_class.values():
         for cls, n in counts_by_cls.items():
-            ipv4_good_by_cls[cls] += n
+            routable_good_by_cls[cls] += n
 
     sybil_bars = []
     for cls, lbl in zip(classes, labels):
-        organic = ipv4_good_by_cls.get(cls, 0) - sybil_by_cls.get(cls, 0)
+        organic = routable_good_by_cls.get(cls, 0) - sybil_by_cls.get(cls, 0)
         sybil_n = sybil_by_cls.get(cls, 0)
         sybil_bars.append({"label": lbl, "key": cls, "value": organic})
         if sybil_n > 0:
@@ -269,7 +277,7 @@ def build_data(rows: list[dict]) -> dict:
     prefix_table = []
     for p in top_prefixes:
         prefix_table.append({
-            "prefix": f"{p}.0.0/16",
+            "prefix": p,
             "total": prefix_totals[p],
             "core": prefix_by_class[p].get("core", 0),
             "knots": prefix_by_class[p].get("knots", 0),
@@ -339,7 +347,7 @@ def build_data(rows: list[dict]) -> dict:
             "mean": round(mean, 1),
             "stddev": round(stddev, 1),
             "threshold": round(sybil_threshold),
-            "prefixes": [f"{p}.0.0/16" for p in sybil_prefixes],
+            "prefixes": sybil_prefixes,
             "count": sybil_count,
             "bars": sybil_bars,
         },
@@ -348,14 +356,14 @@ def build_data(rows: list[dict]) -> dict:
             "series": net_class_sybil_series,
         },
         "top_prefixes": {
-            "labels": [f"{p}.x.x" for p in top_prefixes],
+            "labels": top_prefixes,
             "series": top_prefix_series,
         },
         "prefix_table": {
             "rows": prefix_table,
             "stats": {
                 "distinct_prefixes": len(prefix_by_class),
-                "total_good_ipv4": sum(prefix_totals.values()),
+                "total_good_routable": sum(prefix_totals.values()),
                 "sybil_prefix_count": len(sybil_prefixes),
                 "sybil_by_class": sybil_by_class_pct,
             },
