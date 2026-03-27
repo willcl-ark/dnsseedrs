@@ -48,11 +48,13 @@ tailwind.config = {
 
     <section id="classification" class="bg-od-bg1 rounded-lg p-6">
       <h2 class="text-lg font-semibold mb-4"><a href="#classification" class="text-od-fg hover:text-od-blue">Known &amp; Good Nodes by Classification</a></h2>
+      <p class="text-od-grey text-sm mb-3">No sybil delineation applied.</p>
       <canvas id="chart-classification"></canvas>
     </section>
 
     <section id="distribution" class="bg-od-bg1 rounded-lg p-6">
       <h2 class="text-lg font-semibold mb-4"><a href="#distribution" class="text-od-fg hover:text-od-blue">Node Distribution</a></h2>
+      <p class="text-od-grey text-sm mb-3">No sybil delineation applied.</p>
       <div class="grid grid-cols-2 gap-4">
         <div><p class="text-center text-sm text-od-lgrey mb-2">Known Nodes</p><canvas id="chart-pie-known"></canvas></div>
         <div><p class="text-center text-sm text-od-lgrey mb-2">Good Nodes</p><canvas id="chart-pie-good"></canvas></div>
@@ -61,40 +63,46 @@ tailwind.config = {
 
     <section id="top-ua" class="bg-od-bg1 rounded-lg p-6">
       <h2 class="text-lg font-semibold mb-4"><a href="#top-ua" class="text-od-fg hover:text-od-blue">Top 25 User Agents (Good Nodes)</a></h2>
+      <p class="text-od-grey text-sm mb-3">No sybil delineation applied.</p>
       <div style="height: 600px"><canvas id="chart-top-ua"></canvas></div>
     </section>
 
     <section id="good-rate" class="bg-od-bg1 rounded-lg p-6">
       <h2 class="text-lg font-semibold mb-4"><a href="#good-rate" class="text-od-fg hover:text-od-blue">Good Rate by Classification</a></h2>
+      <p class="text-od-grey text-sm mb-3">No sybil delineation applied.</p>
       <canvas id="chart-good-rate"></canvas>
     </section>
 
     <section id="kb-versions" class="bg-od-bg1 rounded-lg p-6">
       <h2 class="text-lg font-semibold mb-4"><a href="#kb-versions" class="text-od-fg hover:text-od-blue">Knots &amp; BIP110 Version Distribution (Good)</a></h2>
+      <p class="text-od-grey text-sm mb-3">No sybil delineation applied.</p>
       <div style="height: 450px"><canvas id="chart-kb-versions"></canvas></div>
     </section>
 
     <section id="networks" class="bg-od-bg1 rounded-lg p-6">
       <h2 class="text-lg font-semibold mb-4"><a href="#networks" class="text-od-fg hover:text-od-blue">Known &amp; Good Nodes by Network</a></h2>
+      <p class="text-od-grey text-sm mb-3">No sybil delineation applied.</p>
       <canvas id="chart-networks"></canvas>
     </section>
 
     <section id="net-good-rate" class="bg-od-bg1 rounded-lg p-6">
       <h2 class="text-lg font-semibold mb-4"><a href="#net-good-rate" class="text-od-fg hover:text-od-blue">Good Rate by Network</a></h2>
+      <p class="text-od-grey text-sm mb-3">No sybil delineation applied.</p>
       <canvas id="chart-net-good-rate"></canvas>
     </section>
 
     <section id="net-class" class="bg-od-bg1 rounded-lg p-6">
       <h2 class="text-lg font-semibold mb-4"><a href="#net-class" class="text-od-fg hover:text-od-blue">Good Nodes: Network &times; Classification</a></h2>
+      <p class="text-od-grey text-sm mb-3">No sybil delineation applied.</p>
       <canvas id="chart-net-class"></canvas>
     </section>
 
     <section id="sybil" class="bg-od-bg1 rounded-lg p-6">
-      <h2 class="text-lg font-semibold mb-4"><a href="#sybil" class="text-od-fg hover:text-od-blue">Probable Sybil Detection</a></h2>
+      <h2 class="text-lg font-semibold mb-4"><a href="#sybil" class="text-od-fg hover:text-od-blue">Probable Sybil Detection (IPv4 &amp; IPv6 only)</a></h2>
       <p class="text-od-lgrey mb-2">
-        Likely sybil nodes detected by grouping good nodes into IPv4 /24 and IPv6 /48 prefixes and flagging any
+        Likely sybil nodes detected by grouping good IPv4 (/24) and IPv6 (/48) nodes by prefix and flagging any
         prefix where node count exceeds <strong class="text-od-fg">mean + 5&sigma;</strong>
-        (<span id="sybil-stats"></span>).
+        (<span id="sybil-stats"></span>). Tor nodes are excluded as they have no routable prefix.
       </p>
       <p class="text-od-lgrey mb-4">
         Flagged <strong class="text-od-fg" id="sybil-prefix-count"></strong> prefixes containing
@@ -106,11 +114,13 @@ tailwind.config = {
 
     <section id="net-class-sybil" class="bg-od-bg1 rounded-lg p-6">
       <h2 class="text-lg font-semibold mb-4"><a href="#net-class-sybil" class="text-od-fg hover:text-od-blue">Good Nodes: Network &times; Classification (Sybil Filtered)</a></h2>
+      <p class="text-od-grey text-sm mb-3">Probable sybil nodes separated out. Tor nodes shown as-is (no prefix-based sybil detection).</p>
       <canvas id="chart-net-class-sybil"></canvas>
     </section>
 
     <section id="top-prefixes" class="bg-od-bg1 rounded-lg p-6">
       <h2 class="text-lg font-semibold mb-4"><a href="#top-prefixes" class="text-od-fg hover:text-od-blue">Top 20 Prefixes by Good Node Count</a></h2>
+      <p class="text-od-grey text-sm mb-3">IPv4 /24 and IPv6 /48 prefixes. Excludes Tor.</p>
       <div style="height: 550px"><canvas id="chart-top-prefixes"></canvas></div>
     </section>
 
