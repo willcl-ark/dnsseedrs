@@ -6,23 +6,36 @@
 """Analyze bitcoin DNS seeder data and produce JSON for the web dashboard."""
 
 import argparse
+import csv
 import gzip
 import json
 import os
 import ipaddress
 import re
+import subprocess
+import sys
 import urllib.request
 from collections import Counter
 from datetime import datetime, timezone
+from pathlib import Path
 
+SCRIPT_DIR = Path(__file__).resolve().parent
 SEEDS_URL = "https://bitcoin.fish.foo/seeds.txt.gz"
-SEEDS_GZ = "seeds.txt.gz"
-SEEDS_TXT = "seeds.txt"
+SEEDS_GZ = SCRIPT_DIR / "seeds.txt.gz"
+SEEDS_TXT = SCRIPT_DIR / "seeds.txt"
+ASMAP_URL = (
+    "https://github.com/bitcoin-core/asmap-data/raw/refs/heads/main/latest_asmap.dat"
+)
+ASMAP_DAT = SCRIPT_DIR / "latest_asmap.dat"
+ASMAP_DECODED = SCRIPT_DIR / "latest_asmap.decoded"
+ASMAP_TOOL = SCRIPT_DIR / "asmap" / "asmap-tool.py"
+ASN_CSV_URL = "https://github.com/quantcdn/asn-info/raw/refs/heads/master/as.csv"
+ASN_CSV = SCRIPT_DIR / "as.csv"
 
 
 def fetch_seeds(force: bool = False) -> None:
-    if not force and os.path.exists(SEEDS_GZ):
-        print(f"Using cached {SEEDS_GZ} (use --force to re-download)")
+    if not force and SEEDS_GZ.exists():
+        print(f"Using cached {SEEDS_GZ.name} (use --force to re-download)")
         return
     print(f"Downloading {SEEDS_URL} ...")
     urllib.request.urlretrieve(SEEDS_URL, SEEDS_GZ)
@@ -30,10 +43,40 @@ def fetch_seeds(force: bool = False) -> None:
 
 
 def decompress(force: bool = False) -> None:
-    if not force and os.path.exists(SEEDS_TXT):
+    if not force and SEEDS_TXT.exists():
         return
     with gzip.open(SEEDS_GZ, "rb") as f_in, open(SEEDS_TXT, "wb") as f_out:
         f_out.write(f_in.read())
+
+
+def fetch_asmap(force: bool = False) -> None:
+    if not force and ASMAP_DAT.exists():
+        print(f"Using cached {ASMAP_DAT.name} (use --force to re-download)")
+        return
+    print(f"Downloading {ASMAP_URL} ...")
+    urllib.request.urlretrieve(ASMAP_URL, ASMAP_DAT)
+    print("Done.")
+
+
+def decode_asmap(force: bool = False) -> None:
+    if not force and ASMAP_DECODED.exists():
+        print(f"Using cached {ASMAP_DECODED.name} (use --force to re-decode)")
+        return
+    print(f"Decoding {ASMAP_DAT.name} with {ASMAP_TOOL} ...")
+    subprocess.run(
+        [sys.executable, str(ASMAP_TOOL), "decode", str(ASMAP_DAT), str(ASMAP_DECODED)],
+        check=True,
+    )
+    print("Done.")
+
+
+def fetch_asn_csv(force: bool = False) -> None:
+    if not force and ASN_CSV.exists():
+        print(f"Using cached {ASN_CSV.name} (use --force to re-download)")
+        return
+    print(f"Downloading {ASN_CSV_URL} ...")
+    urllib.request.urlretrieve(ASN_CSV_URL, ASN_CSV)
+    print("Done.")
 
 
 def parse_seeds(path: str) -> list[dict]:
@@ -59,16 +102,23 @@ def parse_seeds(path: str) -> list[dict]:
     return rows
 
 
-def extract_prefix(addr: str) -> str | None:
+def extract_host(addr: str) -> str | None:
     if ".onion:" in addr:
         return None
     if addr.startswith("["):
-        host = addr.split("]")[0][1:]
+        return addr.split("]")[0][1:]
+    return addr.split(":")[0]
+
+
+def extract_prefix(addr: str) -> str | None:
+    host = extract_host(addr)
+    if host is None:
+        return None
+    if ":" in host:
         try:
             return str(ipaddress.ip_network(host + "/48", strict=False))
         except ValueError:
             return None
-    host = addr.split(":")[0]
     try:
         return str(ipaddress.ip_network(host + "/24", strict=False))
     except ValueError:
@@ -113,8 +163,107 @@ def extract_version(ua: str) -> str:
     return clean[0]
 
 
+def load_asmap(path: Path) -> dict:
+    tables = {4: {}, 6: {}}
+    masks = {4: {}, 6: {}}
+    counts = Counter()
 
-def build_data(rows: list[dict]) -> dict:
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            prefix, asn = line.split()
+            network = ipaddress.ip_network(prefix, strict=False)
+            version_tables = tables[network.version]
+            if network.prefixlen not in version_tables:
+                version_tables[network.prefixlen] = {}
+                max_bits = network.max_prefixlen
+                if network.prefixlen == 0:
+                    masks[network.version][network.prefixlen] = 0
+                else:
+                    masks[network.version][network.prefixlen] = (
+                        (1 << max_bits) - 1
+                    ) ^ ((1 << (max_bits - network.prefixlen)) - 1)
+            version_tables[network.prefixlen][int(network.network_address)] = asn
+            counts[network.version] += 1
+
+    lengths = {
+        version: sorted(version_tables, reverse=True)
+        for version, version_tables in tables.items()
+    }
+    print(
+        f"\nLoaded ASN map: {counts[4]:,} IPv4 prefixes, {counts[6]:,} IPv6 prefixes from {path}"
+    )
+    return {"tables": tables, "lengths": lengths, "masks": masks, "path": path}
+
+
+def load_asn_names(path: Path) -> dict[str, str]:
+    names = {}
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            asn = row.get("asn")
+            description = row.get("description")
+            handle = row.get("handle")
+            if not asn:
+                continue
+            names[f"AS{asn}"] = description or handle or f"AS{asn}"
+
+    print(f"Loaded ASN names: {len(names):,} entries from {path}")
+    return names
+
+
+def lookup_asn(addr: str, asmap: dict) -> str | None:
+    host = extract_host(addr)
+    if host is None:
+        return None
+
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+
+    return lookup_asn_for_ip(ip, asmap)
+
+
+def lookup_asn_for_ip(
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address, asmap: dict
+) -> str | None:
+    version = ip.version
+    ip_int = int(ip)
+    for prefixlen in asmap["lengths"][version]:
+        network_int = ip_int & asmap["masks"][version][prefixlen]
+        asn = asmap["tables"][version][prefixlen].get(network_int)
+        if asn is not None:
+            return asn
+    return None
+
+
+def lookup_asn_for_prefix(prefix: str, asmap: dict) -> str | None:
+    try:
+        network = ipaddress.ip_network(prefix, strict=False)
+    except ValueError:
+        return None
+    return lookup_asn_for_ip(network.network_address, asmap)
+
+
+def concentration_stats(
+    cluster_by_class: dict[str, Counter],
+) -> tuple[dict[str, int], float, float, float]:
+    cluster_totals = {
+        key: sum(counts.values()) for key, counts in cluster_by_class.items()
+    }
+    counts = list(cluster_totals.values())
+    if not counts:
+        return cluster_totals, 0.0, 0.0, 0.0
+    mean = sum(counts) / len(counts)
+    variance = sum((count - mean) ** 2 for count in counts) / len(counts)
+    stddev = variance**0.5
+    return cluster_totals, mean, stddev, mean + 5 * stddev
+
+
+def build_data(rows: list[dict], asmap: dict, asn_names: dict[str, str]) -> dict:
     classes = ["core", "knots", "bip110", "other"]
     labels = ["Core", "Knots (no BIP110)", "BIP110", "Other"]
 
@@ -139,7 +288,9 @@ def build_data(rows: list[dict]) -> dict:
     total_known = sum(known_vals)
     total_good = sum(good_vals)
 
-    print(f"\nTotal nodes in DB: {total_known + unknown_known:,} ({unknown_known:,} never contacted)")
+    print(
+        f"\nTotal nodes in DB: {total_known + unknown_known:,} ({unknown_known:,} never contacted)"
+    )
     print(f"Known: {total_known:,}, Good: {total_good:,}")
 
     # Top user agents (good nodes)
@@ -192,11 +343,13 @@ def build_data(rows: list[dict]) -> dict:
     # Network x Classification (good nodes)
     net_class_series = []
     for cls, lbl in zip(classes, labels):
-        net_class_series.append({
-            "name": lbl,
-            "key": cls,
-            "values": [cross_good[n][cls] for n in networks],
-        })
+        net_class_series.append(
+            {
+                "name": lbl,
+                "key": cls,
+                "values": [cross_good[n][cls] for n in networks],
+            }
+        )
 
     # IP prefix clustering (IPv4 /24, IPv6 /48)
     prefix_by_class = {}
@@ -209,15 +362,10 @@ def build_data(rows: list[dict]) -> dict:
             prefix_by_class[prefix] = Counter()
         prefix_by_class[prefix][cls] += 1
 
-    prefix_totals = {p: sum(c.values()) for p, c in prefix_by_class.items()}
-
-    # Sybil detection
-    counts = list(prefix_totals.values())
-    mean = sum(counts) / len(counts)
-    variance = sum((c - mean) ** 2 for c in counts) / len(counts)
-    stddev = variance ** 0.5
-    sybil_threshold = mean + 5 * stddev
-    sybil_prefixes = sorted(p for p, total in prefix_totals.items() if total > sybil_threshold)
+    prefix_totals, mean, stddev, sybil_threshold = concentration_stats(prefix_by_class)
+    sybil_prefixes = sorted(
+        p for p, total in prefix_totals.items() if total > sybil_threshold
+    )
 
     def is_sybil(addr: str) -> bool:
         prefix = extract_prefix(addr)
@@ -244,7 +392,9 @@ def build_data(rows: list[dict]) -> dict:
         sybil_n = sybil_by_cls.get(cls, 0)
         sybil_bars.append({"label": lbl, "key": cls, "value": organic})
         if sybil_n > 0:
-            sybil_bars.append({"label": f"{lbl} (sybil)", "key": f"{cls}_sybil", "value": sybil_n})
+            sybil_bars.append(
+                {"label": f"{lbl} (sybil)", "key": f"{cls}_sybil", "value": sybil_n}
+            )
 
     # Network x Classification with sybil
     net_class_sybil_series = []
@@ -253,37 +403,62 @@ def build_data(rows: list[dict]) -> dict:
         for r in good_rows:
             if classify_agent(r["user_agent"]) == cls and is_sybil(r["address"]):
                 sybil_in_cls[classify_network(r["address"])] += 1
-        organic_vals = [cross_good[n].get(cls, 0) - sybil_in_cls.get(n, 0) for n in networks]
+        organic_vals = [
+            cross_good[n].get(cls, 0) - sybil_in_cls.get(n, 0) for n in networks
+        ]
         sybil_vals_net = [sybil_in_cls.get(n, 0) for n in networks]
-        net_class_sybil_series.append({
-            "name": lbl, "key": cls, "values": organic_vals,
-        })
+        net_class_sybil_series.append(
+            {
+                "name": lbl,
+                "key": cls,
+                "values": organic_vals,
+            }
+        )
         if any(v > 0 for v in sybil_vals_net):
-            net_class_sybil_series.append({
-                "name": f"{lbl} (sybil)", "key": f"{cls}_sybil", "values": sybil_vals_net,
-            })
+            net_class_sybil_series.append(
+                {
+                    "name": f"{lbl} (sybil)",
+                    "key": f"{cls}_sybil",
+                    "values": sybil_vals_net,
+                }
+            )
 
     # Top /16 prefixes
     top_prefixes = sorted(prefix_totals, key=prefix_totals.get, reverse=True)[:20]
+    top_prefix_owner_items = []
+    for prefix in top_prefixes:
+        asn = lookup_asn_for_prefix(prefix, asmap)
+        top_prefix_owner_items.append(
+            {
+                "asn": asn,
+                "name": asn_names.get(asn, asn) if asn else None,
+            }
+        )
     top_prefix_series = []
     for cls, lbl in zip(classes, labels):
-        top_prefix_series.append({
-            "name": lbl,
-            "key": cls,
-            "values": [prefix_by_class[p].get(cls, 0) for p in top_prefixes],
-        })
+        top_prefix_series.append(
+            {
+                "name": lbl,
+                "key": cls,
+                "values": [prefix_by_class[p].get(cls, 0) for p in top_prefixes],
+            }
+        )
 
     # Prefix table
     prefix_table = []
-    for p in top_prefixes:
-        prefix_table.append({
-            "prefix": p,
-            "total": prefix_totals[p],
-            "core": prefix_by_class[p].get("core", 0),
-            "knots": prefix_by_class[p].get("knots", 0),
-            "bip110": prefix_by_class[p].get("bip110", 0),
-            "other": prefix_by_class[p].get("other", 0),
-        })
+    for idx, p in enumerate(top_prefixes):
+        prefix_table.append(
+            {
+                "prefix": p,
+                "asn": top_prefix_owner_items[idx]["asn"],
+                "asn_name": top_prefix_owner_items[idx]["name"],
+                "total": prefix_totals[p],
+                "core": prefix_by_class[p].get("core", 0),
+                "knots": prefix_by_class[p].get("knots", 0),
+                "bip110": prefix_by_class[p].get("bip110", 0),
+                "other": prefix_by_class[p].get("other", 0),
+            }
+        )
 
     # Per-class sybil concentration stats
     sybil_by_class_pct = {}
@@ -291,6 +466,93 @@ def build_data(rows: list[dict]) -> dict:
         total = sum(c.get(cls, 0) for c in prefix_by_class.values())
         in_sybil = sum(prefix_by_class[p].get(cls, 0) for p in sybil_prefixes)
         sybil_by_class_pct[cls] = {
+            "total": total,
+            "sybil": in_sybil,
+            "pct": round(in_sybil / total * 100, 1) if total else 0,
+        }
+
+    # ASN clustering
+    asn_by_class = {}
+    for r in good_rows:
+        asn = lookup_asn(r["address"], asmap)
+        if asn is None:
+            continue
+        cls = classify_agent(r["user_agent"])
+        if asn not in asn_by_class:
+            asn_by_class[asn] = Counter()
+        asn_by_class[asn][cls] += 1
+
+    asn_totals, asn_mean, asn_stddev, asn_threshold = concentration_stats(asn_by_class)
+    sybil_asns = sorted(
+        asn for asn, total in asn_totals.items() if total > asn_threshold
+    )
+    sybil_asn_items = [
+        {"asn": asn, "name": asn_names.get(asn, asn)} for asn in sybil_asns
+    ]
+
+    asn_sybil_count = 0
+    asn_sybil_by_cls = Counter()
+    for r in good_rows:
+        asn = lookup_asn(r["address"], asmap)
+        if asn in sybil_asns:
+            asn_sybil_count += 1
+            asn_sybil_by_cls[classify_agent(r["user_agent"])] += 1
+
+    print(
+        f"\nASN concentration: mean={asn_mean:.1f}, σ={asn_stddev:.1f}, threshold={asn_threshold:.0f}"
+    )
+    print(f"  Flagged {len(sybil_asns)} ASNs, {asn_sybil_count:,} nodes")
+
+    asn_bars = []
+    asn_good_by_cls = Counter()
+    for counts_by_cls in asn_by_class.values():
+        for cls, n in counts_by_cls.items():
+            asn_good_by_cls[cls] += n
+
+    for cls, lbl in zip(classes, labels):
+        organic = asn_good_by_cls.get(cls, 0) - asn_sybil_by_cls.get(cls, 0)
+        sybil_n = asn_sybil_by_cls.get(cls, 0)
+        asn_bars.append({"label": lbl, "key": cls, "value": organic})
+        if sybil_n > 0:
+            asn_bars.append(
+                {
+                    "label": f"{lbl} (high concentration AS)",
+                    "key": f"{cls}_sybil",
+                    "value": sybil_n,
+                }
+            )
+
+    top_asns = sorted(asn_totals, key=asn_totals.get, reverse=True)[:20]
+    top_asn_series = []
+    for cls, lbl in zip(classes, labels):
+        top_asn_series.append(
+            {
+                "name": lbl,
+                "key": cls,
+                "values": [asn_by_class[asn].get(cls, 0) for asn in top_asns],
+            }
+        )
+    top_asn_names = [asn_names.get(asn, asn) for asn in top_asns]
+
+    asn_table = []
+    for asn in top_asns:
+        asn_table.append(
+            {
+                "asn": asn,
+                "name": asn_names.get(asn, asn),
+                "total": asn_totals[asn],
+                "core": asn_by_class[asn].get("core", 0),
+                "knots": asn_by_class[asn].get("knots", 0),
+                "bip110": asn_by_class[asn].get("bip110", 0),
+                "other": asn_by_class[asn].get("other", 0),
+            }
+        )
+
+    asn_sybil_by_class_pct = {}
+    for cls in classes:
+        total = sum(c.get(cls, 0) for c in asn_by_class.values())
+        in_sybil = sum(asn_by_class[asn].get(cls, 0) for asn in sybil_asns)
+        asn_sybil_by_class_pct[cls] = {
             "total": total,
             "sybil": in_sybil,
             "pct": round(in_sybil / total * 100, 1) if total else 0,
@@ -307,7 +569,9 @@ def build_data(rows: list[dict]) -> dict:
         cls = classify_agent(r["user_agent"])
         if cls == "other":
             custom_ua[r["user_agent"]] += 1
-    custom_filtered = [{"ua": ua, "count": c} for ua, c in custom_ua.most_common() if c > 1]
+    custom_filtered = [
+        {"ua": ua, "count": c} for ua, c in custom_ua.most_common() if c > 1
+    ]
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -351,12 +615,22 @@ def build_data(rows: list[dict]) -> dict:
             "count": sybil_count,
             "bars": sybil_bars,
         },
+        "asn_sybil": {
+            "mean": round(asn_mean, 1),
+            "stddev": round(asn_stddev, 1),
+            "threshold": round(asn_threshold),
+            "asns": sybil_asns,
+            "items": sybil_asn_items,
+            "count": asn_sybil_count,
+            "bars": asn_bars,
+        },
         "network_classification_sybil": {
             "net_labels": net_labels,
             "series": net_class_sybil_series,
         },
         "top_prefixes": {
             "labels": top_prefixes,
+            "owners": top_prefix_owner_items,
             "series": top_prefix_series,
         },
         "prefix_table": {
@@ -366,6 +640,20 @@ def build_data(rows: list[dict]) -> dict:
                 "total_good_routable": sum(prefix_totals.values()),
                 "sybil_prefix_count": len(sybil_prefixes),
                 "sybil_by_class": sybil_by_class_pct,
+            },
+        },
+        "top_asns": {
+            "labels": top_asns,
+            "names": top_asn_names,
+            "series": top_asn_series,
+        },
+        "asn_table": {
+            "rows": asn_table,
+            "stats": {
+                "mapped_asns": len(asn_by_class),
+                "total_good_routable_mapped": sum(asn_totals.values()),
+                "sybil_asn_count": len(sybil_asns),
+                "sybil_by_class": asn_sybil_by_class_pct,
             },
         },
         "overview_pie": {
@@ -389,11 +677,16 @@ def main():
 
     fetch_seeds(args.force)
     decompress(args.force)
+    fetch_asmap(args.force)
+    decode_asmap(args.force)
+    fetch_asn_csv(args.force)
 
     print("Parsing seeds data...")
     rows = parse_seeds(SEEDS_TXT)
+    asmap = load_asmap(ASMAP_DECODED)
+    asn_names = load_asn_names(ASN_CSV)
 
-    data = build_data(rows)
+    data = build_data(rows, asmap, asn_names)
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w") as f:

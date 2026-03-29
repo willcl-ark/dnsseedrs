@@ -1,7 +1,12 @@
-**/target
-**/sqlite.db*
-**/seeds.txt*
 **/K*.key
 **/K*.private
-/result
+**/seeds.txt*
+**/sqlite.db*
+**/target
+.direnv
 .envrc
+/result
+as.csv
+as.json
+latest_asmap.*
+web/data.json

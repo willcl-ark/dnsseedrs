@@ -112,6 +112,21 @@ tailwind.config = {
       <canvas id="chart-sybil"></canvas>
     </section>
 
+    <section id="asn-concentration" class="bg-od-bg1 rounded-lg p-6">
+      <h2 class="text-lg font-semibold mb-4"><a href="#asn-concentration" class="text-od-fg hover:text-od-blue">High-Concentration ASNs</a></h2>
+      <p class="text-od-lgrey mb-2">
+        Good routable nodes grouped by autonomous system, flagging any
+        ASN where node count exceeds <strong class="text-od-fg">mean + 5&sigma;</strong>
+        (<span id="asn-concentration-stats"></span>). Tor nodes are excluded as they have no routable IP.
+      </p>
+      <p class="text-od-lgrey mb-4">
+        Flagged <strong class="text-od-fg" id="asn-concentration-count"></strong> ASNs containing
+        <strong class="text-od-fg" id="asn-concentration-node-count"></strong> nodes:
+        <span id="asn-concentration-list" class="text-od-grey"></span>
+      </p>
+      <canvas id="chart-asn-concentration"></canvas>
+    </section>
+
     <section id="net-class-sybil" class="bg-od-bg1 rounded-lg p-6">
       <h2 class="text-lg font-semibold mb-4"><a href="#net-class-sybil" class="text-od-fg hover:text-od-blue">Good Nodes: Network &times; Classification (Sybil Filtered)</a></h2>
       <p class="text-od-grey text-sm mb-3">Probable sybil nodes separated out. Tor nodes shown as-is (no prefix-based sybil detection).</p>
@@ -124,6 +139,12 @@ tailwind.config = {
       <div style="height: 550px"><canvas id="chart-top-prefixes"></canvas></div>
     </section>
 
+    <section id="top-asns" class="bg-od-bg1 rounded-lg p-6">
+      <h2 class="text-lg font-semibold mb-4"><a href="#top-asns" class="text-od-fg hover:text-od-blue">Top 20 ASNs by Good Node Count</a></h2>
+      <p class="text-od-grey text-sm mb-3">Routable good IPv4 and IPv6 nodes mapped through <code>latest_asmap.decoded</code>. Excludes Tor.</p>
+      <div style="height: 550px"><canvas id="chart-top-asns"></canvas></div>
+    </section>
+
     <section id="prefix-table" class="bg-od-bg1 rounded-lg p-6">
       <h2 class="text-lg font-semibold mb-4"><a href="#prefix-table" class="text-od-fg hover:text-od-blue">IP Prefix Concentration (Good Nodes)</a></h2>
       <p class="text-od-grey text-sm mb-3" id="prefix-stats"></p>
@@ -131,6 +152,7 @@ tailwind.config = {
         <table class="w-full text-sm">
           <thead><tr class="text-od-cyan border-b border-od-bg2">
             <th class="text-left py-2 px-3">Prefix</th>
+            <th class="text-left py-2 px-3">AS Owner</th>
             <th class="text-right py-2 px-3">Total</th>
             <th class="text-right py-2 px-3">Core</th>
             <th class="text-right py-2 px-3">Knots</th>
@@ -138,6 +160,24 @@ tailwind.config = {
             <th class="text-right py-2 px-3">Other</th>
           </tr></thead>
           <tbody id="prefix-table-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="asn-table" class="bg-od-bg1 rounded-lg p-6">
+      <h2 class="text-lg font-semibold mb-4"><a href="#asn-table" class="text-od-fg hover:text-od-blue">ASN Concentration (Good Nodes)</a></h2>
+      <p class="text-od-grey text-sm mb-3" id="asn-stats"></p>
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead><tr class="text-od-cyan border-b border-od-bg2">
+            <th class="text-left py-2 px-3">ASN</th>
+            <th class="text-right py-2 px-3">Total</th>
+            <th class="text-right py-2 px-3">Core</th>
+            <th class="text-right py-2 px-3">Knots</th>
+            <th class="text-right py-2 px-3">BIP110</th>
+            <th class="text-right py-2 px-3">Other</th>
+          </tr></thead>
+          <tbody id="asn-table-body"></tbody>
         </table>
       </div>
     </section>
@@ -210,7 +250,10 @@ function barChart(id, labels, datasets, opts = {}) {
         x: { stacked: opts.stacked, grid: { color: GRID }, max: opts.maxX },
         y: { stacked: opts.stacked, grid: { color: GRID }, max: opts.maxY },
       },
-      plugins: { legend: { display: datasets.length > 1 } },
+      plugins: {
+        legend: { display: datasets.length > 1 },
+        tooltip: { callbacks: opts.tooltipCallbacks || {} },
+      },
     },
   });
 }
@@ -313,6 +356,21 @@ async function main() {
     backgroundColor: sy.bars.map(b => col(b.key)),
   }]);
 
+  // ASN concentration
+  const asy = D.asn_sybil;
+  document.getElementById('asn-concentration-stats').textContent =
+    `mean=${asy.mean}, σ=${asy.stddev}, threshold=${asy.threshold}`;
+  document.getElementById('asn-concentration-count').textContent = asy.asns.length;
+  document.getElementById('asn-concentration-node-count').textContent = fmt(asy.count);
+  document.getElementById('asn-concentration-list').innerHTML = asy.items.map(item =>
+    `<span title="${escapeHtml(item.name)}">${escapeHtml(item.asn)}</span>`
+  ).join(', ');
+
+  barChart('chart-asn-concentration', asy.bars.map(b => b.label), [{
+    data: asy.bars.map(b => b.value),
+    backgroundColor: asy.bars.map(b => col(b.key)),
+  }]);
+
   // Network x Classification (sybil)
   const ncs = D.network_classification_sybil;
   barChart('chart-net-class-sybil', ncs.net_labels,
@@ -323,7 +381,34 @@ async function main() {
   const tp = D.top_prefixes;
   barChart('chart-top-prefixes', tp.labels,
     tp.series.map(s => ({ label: s.name, data: s.values, backgroundColor: col(s.key) })),
-    { horizontal: true, stacked: true, maintainAspectRatio: false });
+    {
+      horizontal: true,
+      stacked: true,
+      maintainAspectRatio: false,
+      tooltipCallbacks: {
+        afterTitle(items) {
+          const idx = items[0].dataIndex;
+          const owner = tp.owners[idx];
+          return owner && owner.asn ? `${owner.asn} - ${owner.name}` : 'ASN unknown';
+        },
+      },
+    });
+
+  // Top ASNs
+  const ta = D.top_asns;
+  barChart('chart-top-asns', ta.labels,
+    ta.series.map(s => ({ label: s.name, data: s.values, backgroundColor: col(s.key) })),
+    {
+      horizontal: true,
+      stacked: true,
+      maintainAspectRatio: false,
+      tooltipCallbacks: {
+        afterTitle(items) {
+          const idx = items[0].dataIndex;
+          return ta.names[idx];
+        },
+      },
+    });
 
   // Prefix table
   const pt = D.prefix_table;
@@ -337,6 +422,27 @@ async function main() {
   document.getElementById('prefix-table-body').innerHTML = pt.rows.map(r =>
     `<tr class="border-b border-od-bg2">
       <td class="py-2 px-3 font-mono">${escapeHtml(r.prefix)}</td>
+      <td class="py-2 px-3" title="${escapeHtml(r.asn ? `${r.asn} - ${r.asn_name}` : 'ASN unknown')}">${escapeHtml(r.asn_name || 'Unknown')}</td>
+      <td class="text-right py-2 px-3">${fmt(r.total)}</td>
+      <td class="text-right py-2 px-3">${fmt(r.core)}</td>
+      <td class="text-right py-2 px-3">${fmt(r.knots)}</td>
+      <td class="text-right py-2 px-3">${fmt(r.bip110)}</td>
+      <td class="text-right py-2 px-3">${fmt(r.other)}</td>
+    </tr>`
+  ).join('');
+
+  // ASN table
+  const at = D.asn_table;
+  const asc = at.stats.sybil_by_class;
+  document.getElementById('asn-stats').innerHTML =
+    `${fmt(at.stats.mapped_asns)} distinct ASNs across ${fmt(at.stats.total_good_routable_mapped)} mapped good routable nodes<br>` +
+    `${at.stats.sybil_asn_count} high-concentration ASNs hold:<br>` +
+    `&nbsp;&nbsp;${asc.core.pct}% of Core nodes (${fmt(asc.core.sybil)}/${fmt(asc.core.total)})<br>` +
+    `&nbsp;&nbsp;${asc.knots.pct}% of Knots nodes (${fmt(asc.knots.sybil)}/${fmt(asc.knots.total)})<br>` +
+    `&nbsp;&nbsp;${asc.bip110.pct}% of BIP110 nodes (${fmt(asc.bip110.sybil)}/${fmt(asc.bip110.total)})`;
+  document.getElementById('asn-table-body').innerHTML = at.rows.map(r =>
+    `<tr class="border-b border-od-bg2">
+      <td class="py-2 px-3 font-mono" title="${escapeHtml(r.name)}">${escapeHtml(r.asn)}</td>
       <td class="text-right py-2 px-3">${fmt(r.total)}</td>
       <td class="text-right py-2 px-3">${fmt(r.core)}</td>
       <td class="text-right py-2 px-3">${fmt(r.knots)}</td>
