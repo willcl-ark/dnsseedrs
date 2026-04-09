@@ -381,20 +381,11 @@ def build_data(rows: list[dict], asmap: dict, asn_names: dict[str, str]) -> dict
     print(f"  Flagged {len(sybil_prefixes)} prefixes, {sybil_count:,} nodes")
 
     # Sybil breakdown (IPv4 + IPv6, excludes Tor)
-    routable_good_by_cls = Counter()
-    for counts_by_cls in prefix_by_class.values():
-        for cls, n in counts_by_cls.items():
-            routable_good_by_cls[cls] += n
-
     sybil_bars = []
     for cls, lbl in zip(classes, labels):
-        organic = routable_good_by_cls.get(cls, 0) - sybil_by_cls.get(cls, 0)
         sybil_n = sybil_by_cls.get(cls, 0)
-        sybil_bars.append({"label": lbl, "key": cls, "value": organic})
         if sybil_n > 0:
-            sybil_bars.append(
-                {"label": f"{lbl} (sybil)", "key": f"{cls}_sybil", "value": sybil_n}
-            )
+            sybil_bars.append({"label": lbl, "key": cls, "value": sybil_n})
 
     # Network x Classification with sybil
     net_class_sybil_series = []
