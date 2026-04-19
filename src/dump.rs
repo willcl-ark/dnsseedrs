@@ -1,9 +1,7 @@
 use crate::common::{is_good, NodeInfo};
+use crate::db::open_db_connection;
 
-use std::{
-    path::Path,
-    sync::{Arc, Mutex},
-};
+use std::path::Path;
 
 use async_compression::tokio::write::GzipEncoder;
 use bitcoin::network::Network;
@@ -11,11 +9,8 @@ use tokio::fs::{rename, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{sleep, Duration};
 
-pub async fn dumper_thread(
-    db_conn: Arc<Mutex<rusqlite::Connection>>,
-    dump_file: &String,
-    chain: &Network,
-) {
+pub async fn dumper_thread(db_file: &str, dump_file: &str, chain: &Network) {
+    let db_conn = open_db_connection(db_file);
     let mut count = 0;
     loop {
         // Sleep for 100s, then 200s, 400s, 800s, 1600s, and then 3200s forever
@@ -26,8 +21,7 @@ pub async fn dumper_thread(
 
         let nodes: Vec<NodeInfo>;
         {
-            let locked_db_conn = db_conn.lock().unwrap();
-            let mut select_nodes = locked_db_conn
+            let mut select_nodes = db_conn
                 .prepare("SELECT * FROM nodes WHERE try_count > 0")
                 .unwrap();
             let node_iter = select_nodes

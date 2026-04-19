@@ -1,12 +1,13 @@
 use crate::asmap::interpret;
 use crate::common::{is_good, BindProtocol, Host, NodeInfo};
+use crate::db::open_db_connection;
 use crate::dnssec::{parse_dns_keys_dir, DnsSigningKey, RecordsToSign};
 
 use std::{
     collections::{HashMap, HashSet},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, RwLock},
     time,
 };
 
@@ -645,7 +646,7 @@ async fn dns_socket_task(
 async fn fill_cache(
     cache: Arc<RwLock<HashMap<ServiceFlags, CachedAddrs>>>,
     seeder: Arc<SeederInfo>,
-    db_conn: Arc<Mutex<rusqlite::Connection>>,
+    db_conn: rusqlite::Connection,
     asmap: Option<Vec<bool>>,
 ) {
     let mut interval = interval(time::Duration::from_secs(600));
@@ -662,8 +663,7 @@ async fn fill_cache(
         }
 
         // Get nodes from db
-        let locked_db_conn = db_conn.lock().unwrap();
-        let mut select_nodes = locked_db_conn
+        let mut select_nodes = db_conn
             .prepare("SELECT * FROM nodes WHERE try_count > 0")
             .unwrap();
         let node_iter = select_nodes
@@ -799,8 +799,8 @@ async fn fill_cache(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn dns_thread(
+    db_file: &str,
     mut binds: Vec<(BindProtocol, SocketAddr)>,
-    db_conn: Arc<Mutex<rusqlite::Connection>>,
     seed_domain: &str,
     server_name: &str,
     soa_rname: &str,
@@ -822,9 +822,9 @@ pub async fn dns_thread(
 
     let cache_c = cache.clone();
     let seeder_c = seeder.clone();
-    let db_conn_c = db_conn.clone();
+    let db_conn = open_db_connection(db_file);
     tokio::spawn(async move {
-        fill_cache(cache_c, seeder_c, db_conn_c, asmap).await;
+        fill_cache(cache_c, seeder_c, db_conn, asmap).await;
     });
 
     while binds.len() > 1 {

@@ -1,14 +1,16 @@
 mod asmap;
 mod common;
 mod crawl;
+mod db;
 mod dns;
 mod dnssec;
 mod dump;
 
 use crate::{
     asmap::decode_asmap,
-    common::{parse_address, BindProtocol, NetStatus},
+    common::{BindProtocol, NetStatus},
     crawl::crawler_thread,
+    db::{initialize_database, open_db_connection},
     dns::dns_thread,
     dump::dumper_thread,
 };
@@ -19,12 +21,10 @@ use std::{
     path::Path,
     str::FromStr,
     sync::{Arc, Mutex},
-    thread, time,
 };
 
 use bitcoin::network::Network;
 use clap::Parser;
-use rusqlite::params;
 
 #[derive(Parser)]
 #[command(version, about, long_about)]
@@ -165,95 +165,39 @@ async fn main() {
         i2p_proxy: Some(args.i2p_proxy),
     };
 
-    let db_conn = Arc::new(Mutex::new(
-        rusqlite::Connection::open(&args.db_file).unwrap(),
-    ));
-    {
-        let locked_db_conn = db_conn.lock().unwrap();
-        locked_db_conn
-            .busy_handler(Some(|_| {
-                thread::sleep(time::Duration::from_secs(1));
-                true
-            }))
-            .unwrap();
-        locked_db_conn
-            .execute(
-                "CREATE TABLE if NOT EXISTS 'nodes' (
-                address TEXT PRIMARY KEY,
-                last_tried INTEGER NOT NULL,
-                last_seen INTEGER NOT NULL,
-                user_agent TEXT NOT NULL,
-                services BLOB NOT NULL,
-                starting_height INTEGER NOT NULL,
-                protocol_version INTEGER NOT NULL,
-                try_count INTEGER NOT NULL,
-                reliability_2h REAL NOT NULL,
-                reliability_8h REAL NOT NULL,
-                reliability_1d REAL NOT NULL,
-                reliability_1w REAL NOT NULL,
-                reliability_1m REAL NOT NULL
-            )",
-                [],
-            )
-            .unwrap();
-        locked_db_conn
-            .execute(
-                "CREATE INDEX IF NOT EXISTS idx_nodes_last_tried ON nodes(last_tried)",
-                [],
-            )
-            .unwrap();
-
-        let mut new_node_stmt = locked_db_conn.prepare("INSERT OR IGNORE INTO nodes VALUES(?, 0, 0, '', ?, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0)").unwrap();
-        for arg in args.seednode {
-            new_node_stmt
-                .execute(params![arg, 0_u64.to_be_bytes()])
-                .unwrap();
-        }
-
-        // Remove all nodes that have invalid addresses
-        let mut select_nodes = locked_db_conn.prepare("SELECT address FROM nodes").unwrap();
-        let node_iter = select_nodes
-            .query_map([], |row| Ok(row.get::<usize, String>(0).unwrap()))
-            .unwrap();
-        for node in node_iter {
-            let addr = node.unwrap();
-            match parse_address(&addr) {
-                Ok(_) => (),
-                Err(_) => {
-                    println!("Deleting invalid node {}", addr);
-                    let mut del_stmt = locked_db_conn
-                        .prepare("DELETE FROM nodes WHERE address = ?")
-                        .unwrap();
-                    del_stmt.execute(params![addr]).unwrap();
-                }
-            }
-        }
-    }
+    let db_file = args.db_file.clone();
+    let dump_file = args.dump_file.clone();
+    let dump_db_file = db_file.clone();
+    let seed_domain = args.seed_domain.clone();
+    let server_name = args.server_name.clone();
+    let soa_rname = args.soa_rname.clone();
+    let dnssec_keys = args.dnssec_keys.clone();
+    let db_conn = open_db_connection(&db_file);
+    initialize_database(&db_conn, &args.seednode);
+    let crawl_db_conn = Arc::new(Mutex::new(db_conn));
 
     // Start crawler threads
-    let db_conn_c = db_conn.clone();
+    let db_conn_c = crawl_db_conn.clone();
     let net_status_c: NetStatus = net_status.clone();
     let t_crawl = tokio::spawn(async move {
         crawler_thread(db_conn_c, args.threads - 3, net_status_c).await;
     });
 
     // Start dumper thread
-    let db_conn_c2 = db_conn.clone();
     let t_dump = tokio::spawn(async move {
-        dumper_thread(db_conn_c2, &args.dump_file, &chain).await;
+        dumper_thread(&dump_db_file, &dump_file, &chain).await;
     });
 
     // Start DNS thread
-    let db_conn_c3 = db_conn.clone();
     let t_dns = tokio::spawn(async move {
         dns_thread(
+            &db_file,
             binds,
-            db_conn_c3,
-            &args.seed_domain,
-            &args.server_name,
-            &args.soa_rname,
+            &seed_domain,
+            &server_name,
+            &soa_rname,
             &chain,
-            args.dnssec_keys,
+            dnssec_keys,
             asmap,
         )
         .await;
