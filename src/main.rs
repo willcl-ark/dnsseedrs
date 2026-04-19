@@ -89,6 +89,10 @@ struct Args {
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
+    if args.threads == 0 {
+        eprintln!("--threads must be at least 1");
+        std::process::exit(1);
+    }
 
     // Pick the network
     let chain_p = Network::from_core_arg(&args.chain);
@@ -181,7 +185,7 @@ async fn main() {
     let db_conn_c = crawl_db_conn.clone();
     let net_status_c: NetStatus = net_status.clone();
     let t_crawl = tokio::spawn(async move {
-        crawler_thread(db_conn_c, args.threads - 3, net_status_c).await;
+        crawler_thread(db_conn_c, args.threads, net_status_c).await;
     });
 
     // Start dumper thread

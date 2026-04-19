@@ -792,6 +792,13 @@ fn calculate_reliability(good: bool, old_reliability: f64, age: u64, window: u64
     (alpha * x) + ((1.0 - alpha) * old_reliability) // alpha * x + (1 - alpha) * s_{t-1}
 }
 
+fn proxy_concurrency_caps(crawl_threads: usize) -> (usize, usize) {
+    (
+        crawl_threads.min(MAX_ONION_CONCURRENCY),
+        crawl_threads.min(MAX_I2P_CONCURRENCY),
+    )
+}
+
 fn crawl_transport(host: &Host) -> CrawlTransport {
     match host {
         Host::OnionV3(..) => CrawlTransport::Onion,
@@ -1012,13 +1019,12 @@ pub async fn crawler_thread(
 
     // Semaphore to limit how many tasks are spawned
     let sem = Arc::new(Semaphore::new(threads));
-    let onion_sem = Arc::new(Semaphore::new(threads.min(MAX_ONION_CONCURRENCY)));
-    let i2p_sem = Arc::new(Semaphore::new(threads.min(MAX_I2P_CONCURRENCY)));
+    let (onion_cap, i2p_cap) = proxy_concurrency_caps(threads);
+    let onion_sem = Arc::new(Semaphore::new(onion_cap));
+    let i2p_sem = Arc::new(Semaphore::new(i2p_cap));
     info!(
-        "Crawl concurrency caps: total={}, onion={}, i2p={}",
-        threads,
-        threads.min(MAX_ONION_CONCURRENCY),
-        threads.min(MAX_I2P_CONCURRENCY)
+        "Crawl concurrency caps: crawl={}, onion={}, i2p={}",
+        threads, onion_cap, i2p_cap
     );
     let stats = Arc::new(CrawlMinuteStats::default());
     tokio::spawn(log_crawl_stats(stats.clone()));
@@ -1251,7 +1257,7 @@ pub async fn crawler_thread(
 
 #[cfg(test)]
 mod tests {
-    use super::{next_crawl_delay, reserve_nodes_for_crawl, CrawlSlots};
+    use super::{next_crawl_delay, proxy_concurrency_caps, reserve_nodes_for_crawl, CrawlSlots};
     use rusqlite::{params, Connection};
     use std::time::Duration;
 
@@ -1384,5 +1390,11 @@ mod tests {
         let delay =
             next_crawl_delay(&conn, 200, Duration::from_secs(600), Duration::from_secs(5)).unwrap();
         assert_eq!(delay, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn proxy_concurrency_caps_clamp_to_proxy_limits() {
+        assert_eq!(proxy_concurrency_caps(4), (4, 4));
+        assert_eq!(proxy_concurrency_caps(600), (16, 8));
     }
 }
