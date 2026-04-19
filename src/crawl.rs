@@ -39,6 +39,9 @@ use tokio::{
 
 const CRAWL_RETRY_WINDOW: time::Duration = time::Duration::from_secs(60 * 10);
 const MAX_IDLE_WAIT: time::Duration = time::Duration::from_secs(5);
+const MAX_ONION_CONCURRENCY: usize = 16;
+const MAX_I2P_CONCURRENCY: usize = 8;
+const RESERVATION_SCAN_BATCH: usize = 512;
 
 #[derive(Default)]
 struct CrawlMinuteStats {
@@ -76,6 +79,20 @@ impl CrawlMinuteStats {
             self.new_addrs.fetch_add(new_addrs, Ordering::Relaxed);
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum CrawlTransport {
+    Direct,
+    Onion,
+    I2P,
+}
+
+#[derive(Clone, Copy)]
+struct CrawlSlots {
+    global: usize,
+    onion: usize,
+    i2p: usize,
 }
 
 struct CrawlInfo {
@@ -759,47 +776,100 @@ fn calculate_reliability(good: bool, old_reliability: f64, age: u64, window: u64
     (alpha * x) + ((1.0 - alpha) * old_reliability) // alpha * x + (1 - alpha) * s_{t-1}
 }
 
+fn crawl_transport(host: &Host) -> CrawlTransport {
+    match host {
+        Host::OnionV3(..) => CrawlTransport::Onion,
+        Host::I2P(..) => CrawlTransport::I2P,
+        Host::Ipv4(..) | Host::Ipv6(..) | Host::CJDNS(..) => CrawlTransport::Direct,
+    }
+}
+
+fn can_reserve_node(slots: &CrawlSlots, node: &NodeInfo) -> bool {
+    if slots.global == 0 {
+        return false;
+    }
+
+    match crawl_transport(&node.addr.host) {
+        CrawlTransport::Direct => true,
+        CrawlTransport::Onion => slots.onion > 0,
+        CrawlTransport::I2P => slots.i2p > 0,
+    }
+}
+
+fn reserve_slot(slots: &mut CrawlSlots, node: &NodeInfo) {
+    slots.global -= 1;
+    match crawl_transport(&node.addr.host) {
+        CrawlTransport::Direct => (),
+        CrawlTransport::Onion => slots.onion -= 1,
+        CrawlTransport::I2P => slots.i2p -= 1,
+    }
+}
+
 fn reserve_nodes_for_crawl(
     conn: &mut Connection,
     due_before: u64,
     reservation_time: u64,
-    limit: usize,
+    mut slots: CrawlSlots,
 ) -> rusqlite::Result<Vec<NodeInfo>> {
-    if limit == 0 {
+    if slots.global == 0 {
         return Ok(Vec::new());
     }
 
     let tx = conn.transaction()?;
-    let nodes = {
-        let mut select_next_nodes =
-            tx.prepare("SELECT * FROM nodes WHERE last_tried < ? ORDER BY last_tried LIMIT ?")?;
-        let node_iter = select_next_nodes.query_map(
-            params![due_before, i64::try_from(limit).unwrap()],
-            |r| {
-                Ok(NodeInfo::construct(
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    u64::from_be_bytes(r.get(4)?),
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                    r.get(8)?,
-                    r.get(9)?,
-                    r.get(10)?,
-                    r.get(11)?,
-                    r.get(12)?,
-                ))
-            },
-        )?;
-        node_iter
-            .filter_map(|n| match n {
-                Ok(ni) => ni.ok(),
-                Err(..) => None,
-            })
-            .collect::<Vec<_>>()
-    };
+    let mut offset = 0_i64;
+    let mut nodes = Vec::new();
+    while slots.global > 0 {
+        let batch = {
+            let mut select_next_nodes = tx.prepare(
+                "SELECT * FROM nodes WHERE last_tried < ? ORDER BY last_tried LIMIT ? OFFSET ?",
+            )?;
+            let node_iter = select_next_nodes.query_map(
+                params![
+                    due_before,
+                    i64::try_from(RESERVATION_SCAN_BATCH).unwrap(),
+                    offset
+                ],
+                |r| {
+                    Ok(NodeInfo::construct(
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        u64::from_be_bytes(r.get(4)?),
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                        r.get(10)?,
+                        r.get(11)?,
+                        r.get(12)?,
+                    ))
+                },
+            )?;
+            node_iter
+                .filter_map(|n| match n {
+                    Ok(ni) => ni.ok(),
+                    Err(..) => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        if batch.is_empty() {
+            break;
+        }
+
+        offset += i64::try_from(batch.len()).unwrap();
+        for node in batch {
+            if !can_reserve_node(&slots, &node) {
+                continue;
+            }
+            reserve_slot(&mut slots, &node);
+            nodes.push(node);
+            if slots.global == 0 {
+                break;
+            }
+        }
+    }
 
     let mut reserve_stmt = tx.prepare("UPDATE nodes SET last_tried = ? WHERE address = ?")?;
     for node in &nodes {
@@ -926,6 +996,14 @@ pub async fn crawler_thread(
 
     // Semaphore to limit how many tasks are spawned
     let sem = Arc::new(Semaphore::new(threads));
+    let onion_sem = Arc::new(Semaphore::new(threads.min(MAX_ONION_CONCURRENCY)));
+    let i2p_sem = Arc::new(Semaphore::new(threads.min(MAX_I2P_CONCURRENCY)));
+    info!(
+        "Crawl concurrency caps: total={}, onion={}, i2p={}",
+        threads,
+        threads.min(MAX_ONION_CONCURRENCY),
+        threads.min(MAX_I2P_CONCURRENCY)
+    );
     let stats = Arc::new(CrawlMinuteStats::default());
     tokio::spawn(log_crawl_stats(stats.clone()));
 
@@ -945,8 +1023,17 @@ pub async fn crawler_thread(
         let due_before = now.saturating_sub(CRAWL_RETRY_WINDOW.as_secs());
         let nodes = {
             let mut locked_db_conn = db_conn.lock().unwrap();
-            reserve_nodes_for_crawl(&mut locked_db_conn, due_before, now, available_permits)
-                .unwrap()
+            reserve_nodes_for_crawl(
+                &mut locked_db_conn,
+                due_before,
+                now,
+                CrawlSlots {
+                    global: available_permits,
+                    onion: onion_sem.available_permits(),
+                    i2p: i2p_sem.available_permits(),
+                },
+            )
+            .unwrap()
         };
 
         if nodes.is_empty() {
@@ -954,9 +1041,12 @@ pub async fn crawler_thread(
                 let locked_db_conn = db_conn.lock().unwrap();
                 next_crawl_delay(&locked_db_conn, now, CRAWL_RETRY_WINDOW, MAX_IDLE_WAIT).unwrap()
             };
-            if !delay.is_zero() {
-                sleep(delay).await;
-            }
+            sleep(if delay.is_zero() {
+                MAX_IDLE_WAIT
+            } else {
+                delay
+            })
+            .await;
             continue;
         }
 
@@ -964,12 +1054,20 @@ pub async fn crawler_thread(
             let net_status_c: NetStatus = net_status.clone();
             let f_db_conn = db_conn.clone();
             let sem_clone = Arc::clone(&sem);
+            let onion_sem_clone = onion_sem.clone();
+            let i2p_sem_clone = i2p_sem.clone();
             let stats_c = stats.clone();
             let permit = sem_clone.acquire_owned().await.unwrap();
+            let proxy_permit = match crawl_transport(&node.addr.host) {
+                CrawlTransport::Direct => None,
+                CrawlTransport::Onion => Some(onion_sem_clone.acquire_owned().await.unwrap()),
+                CrawlTransport::I2P => Some(i2p_sem_clone.acquire_owned().await.unwrap()),
+            };
 
             // Crawler task
             tokio::spawn(async move {
                 let _permit = permit;
+                let _proxy_permit = proxy_permit;
                 stats_c.record_attempt();
                 let addrs = crawl_node(&node, net_status_c).await;
                 stats_c.record_result(&addrs);
@@ -1137,7 +1235,7 @@ pub async fn crawler_thread(
 
 #[cfg(test)]
 mod tests {
-    use super::{next_crawl_delay, reserve_nodes_for_crawl};
+    use super::{next_crawl_delay, reserve_nodes_for_crawl, CrawlSlots};
     use rusqlite::{params, Connection};
     use std::time::Duration;
 
@@ -1180,7 +1278,17 @@ mod tests {
         insert_node(&conn, "8.8.8.8:8333", 20);
         insert_node(&conn, "9.9.9.9:8333", 30);
 
-        let reserved = reserve_nodes_for_crawl(&mut conn, 25, 100, 2).unwrap();
+        let reserved = reserve_nodes_for_crawl(
+            &mut conn,
+            25,
+            100,
+            CrawlSlots {
+                global: 2,
+                onion: 0,
+                i2p: 0,
+            },
+        )
+        .unwrap();
         let reserved_addrs: Vec<_> = reserved.iter().map(|node| node.addr.to_string()).collect();
 
         assert_eq!(
@@ -1213,6 +1321,43 @@ mod tests {
         assert_eq!(first_last_tried, 100);
         assert_eq!(second_last_tried, 100);
         assert_eq!(untouched_last_tried, 30);
+    }
+
+    #[test]
+    fn reserve_nodes_for_crawl_respects_proxy_caps() {
+        let mut conn = setup_conn();
+        insert_node(
+            &conn,
+            "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion:8333",
+            10,
+        );
+        insert_node(
+            &conn,
+            "udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p:8333",
+            20,
+        );
+        insert_node(&conn, "1.1.1.1:8333", 30);
+
+        let reserved = reserve_nodes_for_crawl(
+            &mut conn,
+            40,
+            100,
+            CrawlSlots {
+                global: 3,
+                onion: 0,
+                i2p: 1,
+            },
+        )
+        .unwrap();
+        let reserved_addrs: Vec<_> = reserved.iter().map(|node| node.addr.to_string()).collect();
+
+        assert_eq!(
+            reserved_addrs,
+            vec![
+                "udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p:8333".to_string(),
+                "1.1.1.1:8333".to_string(),
+            ]
+        );
     }
 
     #[test]
