@@ -82,7 +82,7 @@ impl CrawlMinuteStats {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CrawlTransport {
     Direct,
     Onion,
@@ -101,9 +101,10 @@ struct CrawlInfo {
     age: u64,
 }
 
-struct ReservedNode {
+struct ScannedNode {
     row_address: String,
-    node: NodeInfo,
+    last_tried: u64,
+    transport: CrawlTransport,
 }
 
 enum CrawledNode {
@@ -831,31 +832,58 @@ fn crawl_transport(host: &Host) -> CrawlTransport {
     }
 }
 
-fn can_reserve_node(slots: &CrawlSlots, node: &NodeInfo) -> bool {
+fn can_reserve_transport(slots: &CrawlSlots, transport: CrawlTransport) -> bool {
     if slots.global == 0 {
         return false;
     }
 
-    match crawl_transport(&node.addr.host) {
+    match transport {
         CrawlTransport::Direct => true,
         CrawlTransport::Onion => slots.onion > 0,
         CrawlTransport::I2P => slots.i2p > 0,
     }
 }
 
-fn reserve_slot(slots: &mut CrawlSlots, node: &NodeInfo) {
+fn reserve_transport_slot(slots: &mut CrawlSlots, transport: CrawlTransport) {
     slots.global -= 1;
-    match crawl_transport(&node.addr.host) {
+    match transport {
         CrawlTransport::Direct => (),
         CrawlTransport::Onion => slots.onion -= 1,
         CrawlTransport::I2P => slots.i2p -= 1,
     }
 }
 
-fn node_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Option<ReservedNode>> {
+fn scan_transport(address: &str) -> Option<CrawlTransport> {
+    // Nodes in the database have already passed full address validation, so the
+    // scan phase only needs to distinguish proxy-backed transports. Everything
+    // else, including IPv4/IPv6/CJDNS, uses direct connectivity.
+    let (host, _) = address.rsplit_once(':')?;
+    if host.len() == 62 && host.ends_with(".onion") {
+        return Some(CrawlTransport::Onion);
+    }
+    if host.len() == 60 && host.ends_with(".b32.i2p") {
+        return Some(CrawlTransport::I2P);
+    }
+    Some(CrawlTransport::Direct)
+}
+
+fn scan_node_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Option<ScannedNode>> {
+    let address: String = r.get(0)?;
+    let Some(transport) = scan_transport(&address) else {
+        return Ok(None);
+    };
+
+    Ok(Some(ScannedNode {
+        row_address: address,
+        last_tried: r.get(1)?,
+        transport,
+    }))
+}
+
+fn full_node_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Option<NodeInfo>> {
     let address: String = r.get(0)?;
     Ok(NodeInfo::construct(
-        address.clone(),
+        address,
         r.get(1)?,
         r.get(2)?,
         r.get(3)?,
@@ -869,11 +897,7 @@ fn node_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Option<ReservedNode>
         r.get(11)?,
         r.get(12)?,
     )
-    .ok()
-    .map(|node| ReservedNode {
-        row_address: address,
-        node,
-    }))
+    .ok())
 }
 
 fn reserve_nodes_for_crawl(
@@ -888,23 +912,22 @@ fn reserve_nodes_for_crawl(
 
     let tx = conn.transaction()?;
     let mut cursor: Option<(u64, String)> = None;
-    let mut nodes = Vec::new();
     let mut reserved_addresses = Vec::new();
     while slots.global > 0 {
-        // Continue each batch from the last scanned `(last_tried, address)` tuple so
-        // SQLite can walk the reservation index sequentially instead of skipping
-        // an ever-growing OFFSET worth of due rows.
+        // Scan only the index-covered `(address, last_tried)` fields here so the
+        // reservation walk stays on the composite index; fetch full rows only for
+        // addresses that actually get reserved.
         let batch = {
             let mut select_next_nodes = match &cursor {
                 Some(..) => tx.prepare(
-                    "SELECT * FROM nodes
+                    "SELECT address, last_tried FROM nodes
                      WHERE (last_tried, address) > (?, ?)
                        AND last_tried < ?
                      ORDER BY last_tried, address
                      LIMIT ?",
                 )?,
                 None => tx.prepare(
-                    "SELECT * FROM nodes
+                    "SELECT address, last_tried FROM nodes
                      WHERE last_tried < ?
                      ORDER BY last_tried, address
                      LIMIT ?",
@@ -918,11 +941,11 @@ fn reserve_nodes_for_crawl(
                         due_before,
                         i64::try_from(RESERVATION_SCAN_BATCH).unwrap()
                     ],
-                    node_from_row,
+                    scan_node_from_row,
                 )?,
                 None => select_next_nodes.query_map(
                     params![due_before, i64::try_from(RESERVATION_SCAN_BATCH).unwrap()],
-                    node_from_row,
+                    scan_node_from_row,
                 )?,
             };
             node_iter
@@ -937,24 +960,34 @@ fn reserve_nodes_for_crawl(
         }
 
         if let Some(last_scanned) = batch.last() {
-            cursor = Some((
-                last_scanned.node.last_tried,
-                last_scanned.row_address.clone(),
-            ));
+            cursor = Some((last_scanned.last_tried, last_scanned.row_address.clone()));
         }
 
-        for reserved_node in batch {
-            if !can_reserve_node(&slots, &reserved_node.node) {
+        for scanned_node in batch {
+            if !can_reserve_transport(&slots, scanned_node.transport) {
                 continue;
             }
-            reserve_slot(&mut slots, &reserved_node.node);
-            reserved_addresses.push(reserved_node.row_address);
-            nodes.push(reserved_node.node);
+            reserve_transport_slot(&mut slots, scanned_node.transport);
+            reserved_addresses.push(scanned_node.row_address);
             if slots.global == 0 {
                 break;
             }
         }
     }
+
+    let mut nodes = Vec::with_capacity(reserved_addresses.len());
+    let mut fetch_node_stmt = tx.prepare("SELECT * FROM nodes WHERE address = ?")?;
+    for address in &reserved_addresses {
+        let Some(node) = fetch_node_stmt
+            .query_row(params![address], full_node_from_row)
+            .optional()?
+            .flatten()
+        else {
+            continue;
+        };
+        nodes.push(node);
+    }
+    drop(fetch_node_stmt);
 
     let mut reserve_stmt = tx.prepare("UPDATE nodes SET last_tried = ? WHERE address = ?")?;
     for address in &reserved_addresses {
@@ -1320,8 +1353,8 @@ pub async fn crawler_thread(
 #[cfg(test)]
 mod tests {
     use super::{
-        next_crawl_delay, proxy_concurrency_caps, reserve_nodes_for_crawl, CrawlSlots,
-        RESERVATION_SCAN_BATCH,
+        next_crawl_delay, proxy_concurrency_caps, reserve_nodes_for_crawl, scan_transport,
+        CrawlSlots, CrawlTransport, RESERVATION_SCAN_BATCH,
     };
     use rusqlite::{params, Connection};
     use std::time::Duration;
@@ -1508,12 +1541,12 @@ mod tests {
     }
 
     #[test]
-    fn reserve_nodes_cursor_query_uses_composite_index() {
+    fn reserve_nodes_scan_query_uses_covering_index() {
         let conn = setup_conn();
         let plan_rows = conn
             .prepare(
                 "EXPLAIN QUERY PLAN
-                 SELECT * FROM nodes
+                 SELECT address, last_tried FROM nodes
                  WHERE (last_tried, address) > (?, ?)
                    AND last_tried < ?
                  ORDER BY last_tried, address
@@ -1532,7 +1565,28 @@ mod tests {
             .any(|detail| detail.contains("idx_nodes_last_tried_address")));
         assert!(plan_rows
             .iter()
+            .any(|detail| detail.contains("COVERING INDEX")));
+        assert!(plan_rows
+            .iter()
             .any(|detail| detail.contains("(last_tried,address)>(?,?)")));
+    }
+
+    #[test]
+    fn scan_transport_classifies_proxy_addresses_without_full_parse() {
+        assert_eq!(scan_transport("1.1.1.1:8333"), Some(CrawlTransport::Direct));
+        assert_eq!(
+            scan_transport("[2602:100:abcd::1]:8333"),
+            Some(CrawlTransport::Direct)
+        );
+        assert_eq!(
+            scan_transport("duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion:8333"),
+            Some(CrawlTransport::Onion)
+        );
+        assert_eq!(
+            scan_transport("udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p:8333"),
+            Some(CrawlTransport::I2P)
+        );
+        assert_eq!(scan_transport("not-an-address"), None);
     }
 
     #[test]
