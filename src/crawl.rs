@@ -1,7 +1,6 @@
-use crate::common::{Host, NetStatus, NodeAddress, NodeInfo};
+use crate::common::{Host, NetStatus, NodeInfo};
 
 use std::{
-    collections::HashSet,
     error::Error,
     io::BufReader as StdBufReader,
     net::{IpAddr, SocketAddr},
@@ -25,14 +24,18 @@ use bitcoin::{
         Magic, ServiceFlags,
     },
 };
-use rusqlite::params;
+use rusqlite::{params, Connection, OptionalExtension};
 use sha3::{Digest, Sha3_256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader},
     net::TcpStream,
     sync::Semaphore,
+    time::sleep,
     time::timeout,
 };
+
+const CRAWL_RETRY_WINDOW: time::Duration = time::Duration::from_secs(60 * 10);
+const MAX_IDLE_WAIT: time::Duration = time::Duration::from_secs(5);
 
 struct CrawlInfo {
     node_info: NodeInfo,
@@ -715,6 +718,84 @@ fn calculate_reliability(good: bool, old_reliability: f64, age: u64, window: u64
     (alpha * x) + ((1.0 - alpha) * old_reliability) // alpha * x + (1 - alpha) * s_{t-1}
 }
 
+fn reserve_nodes_for_crawl(
+    conn: &mut Connection,
+    due_before: u64,
+    reservation_time: u64,
+    limit: usize,
+) -> rusqlite::Result<Vec<NodeInfo>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let tx = conn.transaction()?;
+    let nodes = {
+        let mut select_next_nodes =
+            tx.prepare("SELECT * FROM nodes WHERE last_tried < ? ORDER BY last_tried LIMIT ?")?;
+        let node_iter = select_next_nodes.query_map(
+            params![due_before, i64::try_from(limit).unwrap()],
+            |r| {
+                Ok(NodeInfo::construct(
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    u64::from_be_bytes(r.get(4)?),
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                    r.get(10)?,
+                    r.get(11)?,
+                    r.get(12)?,
+                ))
+            },
+        )?;
+        node_iter
+            .filter_map(|n| match n {
+                Ok(ni) => ni.ok(),
+                Err(..) => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut reserve_stmt = tx.prepare("UPDATE nodes SET last_tried = ? WHERE address = ?")?;
+    for node in &nodes {
+        reserve_stmt.execute(params![reservation_time, node.addr.to_string()])?;
+    }
+    drop(reserve_stmt);
+    tx.commit()?;
+
+    Ok(nodes)
+}
+
+fn next_crawl_delay(
+    conn: &Connection,
+    now: u64,
+    retry_window: time::Duration,
+    max_idle_wait: time::Duration,
+) -> rusqlite::Result<time::Duration> {
+    let oldest_last_tried = conn
+        .query_row(
+            "SELECT last_tried FROM nodes ORDER BY last_tried LIMIT 1",
+            [],
+            |row| row.get::<usize, u64>(0),
+        )
+        .optional()?;
+
+    let Some(oldest_last_tried) = oldest_last_tried else {
+        return Ok(max_idle_wait);
+    };
+
+    let next_due = oldest_last_tried.saturating_add(retry_window.as_secs());
+    if next_due <= now {
+        return Ok(time::Duration::ZERO);
+    }
+
+    Ok(time::Duration::from_secs(next_due - now).min(max_idle_wait))
+}
+
 pub async fn crawler_thread(
     db_conn: Arc<Mutex<rusqlite::Connection>>,
     threads: usize,
@@ -788,78 +869,42 @@ pub async fn crawler_thread(
     // Semaphore to limit how many tasks are spawned
     let sem = Arc::new(Semaphore::new(threads));
 
-    // Track which nodes a task is already crawling
-    let nodes_in_flight = Arc::new(Mutex::new(HashSet::<NodeAddress>::new()));
-
     // Crawler loop
     loop {
-        // Get nodes that were last tried more than 10 min ago, sorted oldest first
-        let ten_min_ago = (time::SystemTime::now()
-            .duration_since(time::SystemTime::UNIX_EPOCH)
-            .unwrap()
-            - time::Duration::from_secs(60 * 10))
-        .as_secs();
-        let nodes: Vec<NodeInfo>;
-        {
-            let locked_db_conn = db_conn.lock().unwrap();
-            let mut select_next_nodes = locked_db_conn
-                .prepare("SELECT * FROM nodes WHERE last_tried < ? ORDER BY last_tried")
-                .unwrap();
-            let node_iter = select_next_nodes
-                .query_map([ten_min_ago], |r| {
-                    Ok(NodeInfo::construct(
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        u64::from_be_bytes(r.get(4)?),
-                        r.get(5)?,
-                        r.get(6)?,
-                        r.get(7)?,
-                        r.get(8)?,
-                        r.get(9)?,
-                        r.get(10)?,
-                        r.get(11)?,
-                        r.get(12)?,
-                    ))
-                })
-                .unwrap();
-            nodes = node_iter
-                .filter_map(|n| match n {
-                    Ok(ni) => ni.ok(),
-                    Err(..) => None,
-                })
-                .collect();
+        let available_permits = sem.available_permits();
+        if available_permits == 0 {
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            drop(permit);
+            continue;
         }
 
-        // Spawn a task to crawl each node, limited by the semaphore which uses the threads argument
-        for node in nodes {
-            {
-                let mut in_flight = nodes_in_flight.lock().unwrap();
-                if in_flight.get(&node.addr).is_some() {
-                    println!(
-                        "Crawl spawner: {} is already in flight",
-                        &node.addr.to_string()
-                    );
-                    continue;
-                }
-                in_flight.insert(node.addr.clone());
-            }
+        let now = time::SystemTime::now()
+            .duration_since(time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let due_before = now.saturating_sub(CRAWL_RETRY_WINDOW.as_secs());
+        let nodes = {
+            let mut locked_db_conn = db_conn.lock().unwrap();
+            reserve_nodes_for_crawl(&mut locked_db_conn, due_before, now, available_permits)
+                .unwrap()
+        };
 
-            let f_in_flight = nodes_in_flight.clone();
+        if nodes.is_empty() {
+            let delay = {
+                let locked_db_conn = db_conn.lock().unwrap();
+                next_crawl_delay(&locked_db_conn, now, CRAWL_RETRY_WINDOW, MAX_IDLE_WAIT).unwrap()
+            };
+            if !delay.is_zero() {
+                sleep(delay).await;
+            }
+            continue;
+        }
+
+        for node in nodes {
             let net_status_c: NetStatus = net_status.clone();
             let f_db_conn = db_conn.clone();
             let sem_clone = Arc::clone(&sem);
-            println!(
-                "Crawl spawner - {}: waiting for semaphore, {} permits available",
-                &node.addr.to_string(),
-                sem_clone.available_permits()
-            );
-            let permit = sem_clone.acquire_owned().await;
-            println!(
-                "Crawl spawner - {}: acquired semaphore",
-                &node.addr.to_string()
-            );
+            let permit = sem_clone.acquire_owned().await.unwrap();
 
             // Crawler task
             tokio::spawn(async move {
@@ -1022,11 +1067,98 @@ pub async fn crawler_thread(
                     &node.addr.to_string()
                 );
                 */
-
-                {
-                    f_in_flight.lock().unwrap().remove(&node.addr);
-                }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{next_crawl_delay, reserve_nodes_for_crawl};
+    use rusqlite::{params, Connection};
+    use std::time::Duration;
+
+    fn setup_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE nodes (
+                address TEXT PRIMARY KEY,
+                last_tried INTEGER NOT NULL,
+                last_seen INTEGER NOT NULL,
+                user_agent TEXT NOT NULL,
+                services BLOB NOT NULL,
+                starting_height INTEGER NOT NULL,
+                protocol_version INTEGER NOT NULL,
+                try_count INTEGER NOT NULL,
+                reliability_2h REAL NOT NULL,
+                reliability_8h REAL NOT NULL,
+                reliability_1d REAL NOT NULL,
+                reliability_1w REAL NOT NULL,
+                reliability_1m REAL NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_node(conn: &Connection, address: &str, last_tried: u64) {
+        conn.execute(
+            "INSERT INTO nodes VALUES(?, ?, 0, '', ?, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0)",
+            params![address, last_tried, 0_u64.to_be_bytes()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reserve_nodes_for_crawl_respects_order_and_limit() {
+        let mut conn = setup_conn();
+        insert_node(&conn, "1.1.1.1:8333", 10);
+        insert_node(&conn, "8.8.8.8:8333", 20);
+        insert_node(&conn, "9.9.9.9:8333", 30);
+
+        let reserved = reserve_nodes_for_crawl(&mut conn, 25, 100, 2).unwrap();
+        let reserved_addrs: Vec<_> = reserved.iter().map(|node| node.addr.to_string()).collect();
+
+        assert_eq!(
+            reserved_addrs,
+            vec!["1.1.1.1:8333".to_string(), "8.8.8.8:8333".to_string()]
+        );
+
+        let first_last_tried: u64 = conn
+            .query_row(
+                "SELECT last_tried FROM nodes WHERE address = ?",
+                ["1.1.1.1:8333"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let second_last_tried: u64 = conn
+            .query_row(
+                "SELECT last_tried FROM nodes WHERE address = ?",
+                ["8.8.8.8:8333"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let untouched_last_tried: u64 = conn
+            .query_row(
+                "SELECT last_tried FROM nodes WHERE address = ?",
+                ["9.9.9.9:8333"],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(first_last_tried, 100);
+        assert_eq!(second_last_tried, 100);
+        assert_eq!(untouched_last_tried, 30);
+    }
+
+    #[test]
+    fn next_crawl_delay_caps_idle_wait() {
+        let conn = setup_conn();
+        insert_node(&conn, "1.1.1.1:8333", 100);
+
+        let delay =
+            next_crawl_delay(&conn, 200, Duration::from_secs(600), Duration::from_secs(5)).unwrap();
+        assert_eq!(delay, Duration::from_secs(5));
     }
 }

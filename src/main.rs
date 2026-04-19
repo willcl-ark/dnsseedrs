@@ -196,6 +196,12 @@ async fn main() {
                 [],
             )
             .unwrap();
+        locked_db_conn
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_nodes_last_tried ON nodes(last_tried)",
+                [],
+            )
+            .unwrap();
 
         let mut new_node_stmt = locked_db_conn.prepare("INSERT OR IGNORE INTO nodes VALUES(?, 0, 0, '', ?, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0)").unwrap();
         for arg in args.seednode {
