@@ -129,59 +129,69 @@ async fn socks5_connect(
     sock: &mut TcpStream,
     destination: &str,
     port: u16,
-) -> Result<(), &'static str> {
+) -> Result<(), std::io::Error> {
     // Send first socks message
     // Version (0x05) | Num Auth Methods (0x01) | Auth Method NoAuth (0x00)
-    sock.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
-    sock.flush().await.unwrap();
+    sock.write_all(&[0x05, 0x01, 0x00]).await?;
+    sock.flush().await?;
 
     // Get Server's chosen auth method
     let mut server_auth_method: [u8; 2] = [0; 2];
-    sock.read_exact(&mut server_auth_method).await.unwrap();
+    sock.read_exact(&mut server_auth_method).await?;
     if server_auth_method[0] != 0x05 {
-        return Err("Server responded with unexpected Socks version");
+        return Err(std::io::Error::other(
+            "Server responded with unexpected Socks version",
+        ));
     }
     if server_auth_method[1] != 0x00 {
-        return Err("Server responded with unsupported auth method");
+        return Err(std::io::Error::other(
+            "Server responded with unsupported auth method",
+        ));
     }
 
     // Send request
     // Version (0x05) | Connect Command (0x01) | Reserved (0x00) | Domain name address type (0x03)
-    sock.write_all(&[0x05, 0x01, 0x00, 0x03]).await.unwrap();
+    sock.write_all(&[0x05, 0x01, 0x00, 0x03]).await?;
     // The destination we want the server to connect to
     sock.write_all(&[u8::try_from(destination.len()).unwrap()])
         .await
-        .unwrap();
-    sock.write_all(destination.as_bytes()).await.unwrap();
-    sock.write_all(&port.to_be_bytes()).await.unwrap();
-    sock.flush().await.unwrap();
+        ?;
+    sock.write_all(destination.as_bytes()).await?;
+    sock.write_all(&port.to_be_bytes()).await?;
+    sock.flush().await?;
 
     // Get reply
     let mut server_reply: [u8; 4] = [0; 4];
-    sock.read_exact(&mut server_reply).await.unwrap();
+    sock.read_exact(&mut server_reply).await?;
     if server_reply[0] != 0x05 {
-        return Err("Server responded with unsupported auth method");
+        return Err(std::io::Error::other(
+            "Server responded with unsupported auth method",
+        ));
     }
     if server_reply[1] != 0x00 {
-        return Err("Server could not connect to destination");
+        return Err(std::io::Error::other(
+            "Server could not connect to destination",
+        ));
     }
     if server_reply[2] != 0x00 {
-        return Err("Server responded with unexpected reserved value");
+        return Err(std::io::Error::other(
+            "Server responded with unexpected reserved value",
+        ));
     }
     if server_reply[3] == 0x01 {
         let mut server_bound_addr: [u8; 4] = [0; 4];
-        sock.read_exact(&mut server_bound_addr).await.unwrap();
+        sock.read_exact(&mut server_bound_addr).await?;
     } else if server_reply[3] == 0x03 {
         let mut server_bound_addr_len: [u8; 1] = [0; 1];
-        sock.read_exact(&mut server_bound_addr_len).await.unwrap();
+        sock.read_exact(&mut server_bound_addr_len).await?;
         let mut server_bound_addr = vec![0u8; usize::from(server_bound_addr_len[0])];
-        sock.read_exact(&mut server_bound_addr).await.unwrap();
+        sock.read_exact(&mut server_bound_addr).await?;
     } else if server_reply[3] == 0x04 {
         let mut server_bound_addr: [u8; 16] = [0; 16];
-        sock.read_exact(&mut server_bound_addr).await.unwrap();
+        sock.read_exact(&mut server_bound_addr).await?;
     }
     let mut server_bound_port: [u8; 2] = [0; 2];
-    sock.read_exact(&mut server_bound_port).await.unwrap();
+    sock.read_exact(&mut server_bound_port).await?;
 
     Ok(())
 }
@@ -193,7 +203,7 @@ async fn socks5_connect_with_timeout(
 ) -> Result<(), std::io::Error> {
     match timeout(SOCKS5_TIMEOUT, socks5_connect(sock, destination, port)).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(std::io::Error::other(e)),
+        Ok(Err(e)) => Err(e),
         Err(_) => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "SOCKS5 handshake timed out",
@@ -262,8 +272,8 @@ async fn get_node_addrs_v1(
     // Send sendaddrv2 message
     RawNetworkMessage::new(net_magic, NetworkMessage::SendAddrV2 {})
         .consensus_encode(&mut write_buf)?;
-    write_sock.write_all(&write_buf).await.unwrap();
-    write_sock.flush().await.unwrap();
+    write_sock.write_all(&write_buf).await?;
+    write_sock.flush().await?;
     write_buf.clear();
 
     // Receive loop
@@ -414,8 +424,8 @@ async fn get_node_addrs_v1(
             }
             _ => (),
         };
-        write_sock.write_all(&write_buf).await.unwrap();
-        write_sock.flush().await.unwrap();
+        write_sock.write_all(&write_buf).await?;
+        write_sock.flush().await?;
         write_buf.clear();
     }
     Ok(ret_addrs)
@@ -491,18 +501,22 @@ async fn get_node_addrs_v2(
     };
 
     // Send version and sendaddrv2 messages
-    protocol
+    if let Err(e) = protocol
         .write(&Payload::genuine(V2Serialize(V2NetworkMessage::Version(
             ver_msg,
         ))))
         .await
-        .unwrap();
-    protocol
+    {
+        return Err(Box::new(std::io::Error::other(e.to_string())));
+    }
+    if let Err(e) = protocol
         .write(&Payload::genuine(V2Serialize(
             V2NetworkMessage::SendAddrV2 {},
         )))
         .await
-        .unwrap();
+    {
+        return Err(Box::new(std::io::Error::other(e.to_string())));
+    }
     write_buf.clear();
 
     // Receive loop
@@ -522,14 +536,18 @@ async fn get_node_addrs_v2(
         match msg {
             NetworkMessage::Version(ver) => {
                 // Send verack and getaddr
-                protocol
+                if let Err(e) = protocol
                     .write(&Payload::genuine(V2Serialize(V2NetworkMessage::Verack {})))
                     .await
-                    .unwrap();
-                protocol
+                {
+                    return Err(Box::new(std::io::Error::other(e.to_string())));
+                }
+                if let Err(e) = protocol
                     .write(&Payload::genuine(V2Serialize(V2NetworkMessage::GetAddr {})))
                     .await
-                    .unwrap();
+                {
+                    return Err(Box::new(std::io::Error::other(e.to_string())));
+                }
 
                 let mut new_info = node.clone();
                 new_info.last_tried = tried_timestamp;
@@ -614,10 +632,12 @@ async fn get_node_addrs_v2(
                 break;
             }
             NetworkMessage::Ping(ping) => {
-                protocol
+                if let Err(e) = protocol
                     .write(&Payload::genuine(V2Serialize(V2NetworkMessage::Pong(ping))))
                     .await
-                    .unwrap();
+                {
+                    return Err(Box::new(std::io::Error::other(e.to_string())));
+                }
             }
             _ => (),
         };
@@ -728,7 +748,7 @@ async fn crawl_node(node: &NodeInfo, net_status: NetStatus) -> Vec<CrawledNode> 
                     node_info.last_tried = tried_timestamp;
                     ret_addrs.push(CrawledNode::Failed(CrawlInfo { node_info, age }));
                     debug!("Failed crawl: {}, {}", &node.addr.to_string(), v2_err);
-                    v2_sock.shutdown().await.unwrap();
+                    let _ = v2_sock.shutdown().await;
                     return ret_addrs;
                 }
             }
@@ -737,7 +757,7 @@ async fn crawl_node(node: &NodeInfo, net_status: NetStatus) -> Vec<CrawledNode> 
             debug!("{} v2 connection timed out", &node.addr.to_string());
         }
     };
-    v2_sock.shutdown().await.unwrap();
+    let _ = v2_sock.shutdown().await;
 
     if ret_addrs.is_empty() {
         // Only timeout or V2ConnectError failures, so try v1
@@ -766,7 +786,7 @@ async fn crawl_node(node: &NodeInfo, net_status: NetStatus) -> Vec<CrawledNode> 
                     node_info.last_tried = tried_timestamp;
                     ret_addrs.push(CrawledNode::Failed(CrawlInfo { node_info, age }));
                     debug!("Failed crawl: {}, {}", &node.addr.to_string(), v1_err);
-                    v1_sock.shutdown().await.unwrap();
+                    let _ = v1_sock.shutdown().await;
                     return ret_addrs;
                 }
             },
@@ -775,11 +795,11 @@ async fn crawl_node(node: &NodeInfo, net_status: NetStatus) -> Vec<CrawledNode> 
                 let mut node_info = node.clone();
                 node_info.last_tried = tried_timestamp;
                 ret_addrs.push(CrawledNode::Failed(CrawlInfo { node_info, age }));
-                v1_sock.shutdown().await.unwrap();
+                let _ = v1_sock.shutdown().await;
                 return ret_addrs;
             }
         };
-        v1_sock.shutdown().await.unwrap();
+        let _ = v1_sock.shutdown().await;
     }
 
     debug!("Done {}", &node.addr.to_string());
