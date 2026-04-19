@@ -1,7 +1,7 @@
 use crate::common::{is_good, NodeInfo};
 use crate::db::{node_info_from_row, open_db_connection, NODE_SELECT_COLUMNS};
 
-use std::path::Path;
+use std::{path::Path, time::Instant};
 
 use async_compression::tokio::write::GzipEncoder;
 use bitcoin::network::Network;
@@ -39,9 +39,11 @@ pub async fn dumper_thread(db_file: &str, dump_file: &str, chain: &Network) {
                 .collect();
         }
 
+        let node_count = nodes.len();
         let txt_tmp_path = format!("{dump_file}.tmp");
+        let txt_start = Instant::now();
+        info!("Starting write of {} with {} nodes", dump_file, node_count);
         let mut txt_tmp_file = File::create(&txt_tmp_path).await.unwrap();
-        info!("Writing txt to temporary file {}", &txt_tmp_path);
         let header = format!(
             "{:<70}{:<6}{:<12}{:^8}{:^8}{:^8}{:^8}{:^8}{:^9}{:<18}{:<8}user_agent\n",
             "# address",
@@ -76,12 +78,20 @@ pub async fn dumper_thread(db_file: &str, dump_file: &str, chain: &Network) {
             let _ = txt_tmp_file.write(line.as_bytes()).await.unwrap();
         }
         txt_tmp_file.flush().await.unwrap();
-        info!("Renaming {txt_tmp_path} to {dump_file}");
         rename(txt_tmp_path.clone(), dump_file).await.unwrap();
+        info!(
+            "Finished writing {} in {:?} with {} nodes",
+            dump_file,
+            txt_start.elapsed(),
+            node_count
+        );
 
         // Compress with gz
         let gz_tmp_path = format!("{dump_file}.gz.tmp");
-        info!("Writing gz to temporary file {gz_tmp_path}");
+        let gz_path = format!("{dump_file}.gz");
+        let archive_path = Path::new(&gz_path);
+        let gz_start = Instant::now();
+        info!("Starting write of {}", archive_path.display());
         let gz_tmp_file = File::create(&gz_tmp_path).await.unwrap();
         let mut enc = GzipEncoder::new(gz_tmp_file);
         let f = File::open(dump_file).await.unwrap();
@@ -97,9 +107,11 @@ pub async fn dumper_thread(db_file: &str, dump_file: &str, chain: &Network) {
         }
         enc.shutdown().await.unwrap();
 
-        let gz_path = format!("{dump_file}.gz");
-        let archive_path = Path::new(&gz_path);
-        info!("Renaming {gz_tmp_path} to {archive_path:?}");
         rename(gz_tmp_path, archive_path).await.unwrap();
+        info!(
+            "Finished writing {} in {:?}",
+            archive_path.display(),
+            gz_start.elapsed()
+        );
     }
 }

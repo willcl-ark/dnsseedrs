@@ -839,10 +839,10 @@ fn refill_queue_for_transport(
     due_before: u64,
     reservation_time: u64,
     high_watermark: usize,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<usize> {
     let target = high_watermark.saturating_sub(queue.len());
     if target == 0 {
-        return Ok(());
+        return Ok(0);
     }
 
     let mut select_nodes = tx.prepare(&format!(
@@ -874,8 +874,9 @@ fn refill_queue_for_transport(
     }
     drop(reserve_stmt);
 
+    let added = nodes.len();
     queue.extend(nodes);
-    Ok(())
+    Ok(added)
 }
 
 fn refill_leased_queues(
@@ -887,8 +888,25 @@ fn refill_leased_queues(
     onion_bounds: (usize, usize),
     i2p_bounds: (usize, usize),
 ) -> rusqlite::Result<()> {
+    let refill_onion = queues.onion.len() < onion_bounds.0;
+    let refill_i2p = queues.i2p.len() < i2p_bounds.0;
+    let refill_direct = queues.direct.len() < direct_bounds.0;
+    if !refill_onion && !refill_i2p && !refill_direct {
+        return Ok(());
+    }
+
+    let refill_start = time::Instant::now();
+    info!(
+        "Starting crawl memory pool refill from db: direct={}/{}, onion={}/{}, i2p={}/{}",
+        queues.direct.len(),
+        direct_bounds.1,
+        queues.onion.len(),
+        onion_bounds.1,
+        queues.i2p.len(),
+        i2p_bounds.1
+    );
     let tx = conn.transaction()?;
-    if queues.onion.len() < onion_bounds.0 {
+    let onion_added = if refill_onion {
         refill_queue_for_transport(
             &tx,
             NodeTransport::Onion,
@@ -896,9 +914,11 @@ fn refill_leased_queues(
             due_before,
             reservation_time,
             onion_bounds.1,
-        )?;
-    }
-    if queues.i2p.len() < i2p_bounds.0 {
+        )?
+    } else {
+        0
+    };
+    let i2p_added = if refill_i2p {
         refill_queue_for_transport(
             &tx,
             NodeTransport::I2P,
@@ -906,9 +926,11 @@ fn refill_leased_queues(
             due_before,
             reservation_time,
             i2p_bounds.1,
-        )?;
-    }
-    if queues.direct.len() < direct_bounds.0 {
+        )?
+    } else {
+        0
+    };
+    let direct_added = if refill_direct {
         refill_queue_for_transport(
             &tx,
             NodeTransport::Direct,
@@ -916,9 +938,21 @@ fn refill_leased_queues(
             due_before,
             reservation_time,
             direct_bounds.1,
-        )?;
-    }
+        )?
+    } else {
+        0
+    };
     tx.commit()?;
+    info!(
+        "Finished crawl memory pool refill from db in {:?}: added direct={}, onion={}, i2p={}; queued direct={}, onion={}, i2p={}",
+        refill_start.elapsed(),
+        direct_added,
+        onion_added,
+        i2p_added,
+        queues.direct.len(),
+        queues.onion.len(),
+        queues.i2p.len()
+    );
     Ok(())
 }
 

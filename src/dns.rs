@@ -713,7 +713,8 @@ async fn fill_cache(
         // Do ever 10 minutes (first time will happen immediately)
         interval.tick().await;
 
-        info!("Refilling cache");
+        let refill_start = time::Instant::now();
+        info!("Starting DNS cache refill from db");
 
         // Fill the cache
         let mut new_cache = HashMap::<ServiceFlags, CachedAddrs>::new();
@@ -729,11 +730,15 @@ async fn fill_cache(
             .unwrap();
         let node_iter = select_nodes.query_map([], node_info_from_row).unwrap();
 
+        let mut scanned_nodes = 0_usize;
+        let mut good_nodes = 0_usize;
         for node_res in node_iter {
+            scanned_nodes += 1;
             let node = node_res.unwrap().unwrap();
             if !is_good(&node, &seeder.chain) {
                 continue;
             }
+            good_nodes += 1;
             for (filter, addrs) in &mut new_cache {
                 if ServiceFlags::from(node.services).has(*filter) {
                     match node.addr.host {
@@ -825,7 +830,20 @@ async fn fill_cache(
                 cache_write.insert(filter, new_addrs);
             }
         }
-        info!("Cache ready");
+        let cached_addrs = {
+            let cache_read = cache.read().unwrap();
+            cache_read
+                .values()
+                .map(|addrs| addrs.ipv4.len() + addrs.ipv6.len())
+                .sum::<usize>()
+        };
+        info!(
+            "Finished DNS cache refill from db in {:?}: scanned_nodes={}, good_nodes={}, cached_addrs={}",
+            refill_start.elapsed(),
+            scanned_nodes,
+            good_nodes,
+            cached_addrs
+        );
     }
 }
 
