@@ -42,6 +42,7 @@ const MAX_IDLE_WAIT: time::Duration = time::Duration::from_secs(5);
 const MAX_ONION_CONCURRENCY: usize = 16;
 const MAX_I2P_CONCURRENCY: usize = 8;
 const RESERVATION_SCAN_BATCH: usize = 512;
+const SOCKS5_TIMEOUT: time::Duration = time::Duration::from_secs(10);
 
 #[derive(Default)]
 struct CrawlMinuteStats {
@@ -126,7 +127,7 @@ impl Error for NetNotAvailableError {}
 
 async fn socks5_connect(
     sock: &mut TcpStream,
-    destination: &String,
+    destination: &str,
     port: u16,
 ) -> Result<(), &'static str> {
     // Send first socks message
@@ -183,6 +184,21 @@ async fn socks5_connect(
     sock.read_exact(&mut server_bound_port).await.unwrap();
 
     Ok(())
+}
+
+async fn socks5_connect_with_timeout(
+    sock: &mut TcpStream,
+    destination: &str,
+    port: u16,
+) -> Result<(), std::io::Error> {
+    match timeout(SOCKS5_TIMEOUT, socks5_connect(sock, destination, port)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(std::io::Error::other(e)),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "SOCKS5 handshake timed out",
+        )),
+    }
 }
 
 async fn get_node_addrs_v1(
@@ -638,10 +654,10 @@ async fn connect_node(
             )
             .await?;
             if let Ok(mut_stream) = &mut stream {
-                let cr = socks5_connect(mut_stream, host, node.addr.port).await;
+                let cr = socks5_connect_with_timeout(mut_stream, host, node.addr.port).await;
                 match cr {
                     Ok(_) => Ok(stream?),
-                    Err(e) => Err(Box::new(std::io::Error::other(e))),
+                    Err(e) => Err(Box::new(e)),
                 }
             } else {
                 Ok(stream?)
@@ -655,10 +671,10 @@ async fn connect_node(
             )
             .await?;
             if let Ok(mut_stream) = &mut stream {
-                let cr = socks5_connect(mut_stream, host, node.addr.port).await;
+                let cr = socks5_connect_with_timeout(mut_stream, host, node.addr.port).await;
                 match cr {
                     Ok(_) => Ok(stream?),
-                    Err(e) => Err(Box::new(std::io::Error::other(e))),
+                    Err(e) => Err(Box::new(e)),
                 }
             } else {
                 Ok(stream?)
@@ -941,9 +957,9 @@ pub async fn crawler_thread(
         .await
         .unwrap();
         if let Ok(onion_proxy_sock) = &mut onion_proxy_check {
-            if socks5_connect(
+            if socks5_connect_with_timeout(
                 onion_proxy_sock,
-                &"duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion".to_string(),
+                "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion",
                 80,
             )
             .await
@@ -972,9 +988,9 @@ pub async fn crawler_thread(
         .await
         .unwrap();
         if let Ok(i2p_proxy_sock) = &mut i2p_proxy_check {
-            if socks5_connect(
+            if socks5_connect_with_timeout(
                 i2p_proxy_sock,
-                &"udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p".to_string(),
+                "udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p",
                 80,
             )
             .await
