@@ -5,7 +5,7 @@ use std::{path::Path, time::Instant};
 
 use async_compression::tokio::write::GzipEncoder;
 use bitcoin::network::Network;
-use log::{info, warn};
+use log::{debug, info, warn};
 use tokio::fs::{rename, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{sleep, Duration};
@@ -20,6 +20,8 @@ pub async fn dumper_thread(db_file: &str, dump_file: &str, chain: &Network) {
             count += 1;
         }
 
+        let load_start = Instant::now();
+        debug!("Starting dump db scan for {}", dump_file);
         let nodes: Vec<NodeInfo>;
         {
             let mut select_nodes = db_conn
@@ -38,6 +40,12 @@ pub async fn dumper_thread(db_file: &str, dump_file: &str, chain: &Network) {
                 })
                 .collect();
         }
+        debug!(
+            "Finished dump db scan for {} in {:?} with {} nodes",
+            dump_file,
+            load_start.elapsed(),
+            nodes.len()
+        );
 
         let node_count = nodes.len();
         let txt_tmp_path = format!("{dump_file}.tmp");
