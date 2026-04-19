@@ -65,6 +65,9 @@ impl CachedAddrs {
 }
 
 fn sample_cached_addrs<T: Copy>(addrs: &[T], limit: usize, rng: &mut impl Rng) -> Vec<T> {
+    // Answers are always chosen from the server-maintained cache. The client can choose
+    // the record type and service-bit filter via the qname, but it cannot inject or
+    // bias specific addresses into the response path.
     if addrs.len() <= limit {
         let mut all = addrs.to_vec();
         all.shuffle(rng);
@@ -486,6 +489,9 @@ async fn process_dns_request(
                     let Some(read_addrs) = cache_read.get(&filter) else {
                         continue;
                     };
+                    // Sample at most 20 server-side cached answers for this filter. This keeps
+                    // per-request work bounded without changing the trust model: the response is
+                    // still derived solely from cached nodes the crawler admitted earlier.
                     sample_cached_addrs(&read_addrs.ipv4, MAX_DNS_RESULTS, &mut rng)
                 };
                 for node in selected {
@@ -505,6 +511,7 @@ async fn process_dns_request(
                     let Some(read_addrs) = cache_read.get(&filter) else {
                         continue;
                     };
+                    // IPv6 answers follow the same server-side sampling path as IPv4 answers.
                     sample_cached_addrs(&read_addrs.ipv6, MAX_DNS_RESULTS, &mut rng)
                 };
                 for node in selected {
@@ -530,6 +537,9 @@ async fn process_dns_request(
         && res.counts().ancount() > 0
         && !seeder.dnskeys.is_empty()
     {
+        // Sign exactly the records selected above. Sampling changes which cached answers are
+        // returned, but when DNSSEC is enabled the final answer set is still authenticated as a
+        // unit before we send it.
         for rrsig in ans_recs_sign.sign(&seeder.dnskeys, &seeder.seed_apex) {
             let _ = res.push(rrsig);
         }
@@ -580,6 +590,8 @@ async fn dns_socket_task(
     if proto == BindProtocol::Udp {
         // Bind UDP socket
         let udp_sock = Arc::new(UdpSocket::bind(bind).await.unwrap());
+        // Bound the number of in-flight UDP handlers so a burst of queries cannot create
+        // unbounded task fanout and starve the runtime.
         let handler_sem = Arc::new(Semaphore::new(UDP_HANDLER_CONCURRENCY));
         info!("Bound UDP socket {}", udp_sock.local_addr().unwrap());
 
@@ -610,6 +622,8 @@ async fn dns_socket_task(
     } else if proto == BindProtocol::Tcp {
         // Bind TCP Socket
         let tcp_sock = TcpListener::bind(bind).await.unwrap();
+        // TCP sessions stay open longer than a single UDP exchange, so keep a separate cap
+        // here to limit concurrent connection handlers.
         let handler_sem = Arc::new(Semaphore::new(TCP_HANDLER_CONCURRENCY));
         info!("Bound TCP socket {}", tcp_sock.local_addr().unwrap());
 
