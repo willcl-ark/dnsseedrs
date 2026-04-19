@@ -1,6 +1,6 @@
 use crate::asmap::interpret;
-use crate::common::{is_good, BindProtocol, Host, NodeInfo};
-use crate::db::open_db_connection;
+use crate::common::{is_good, BindProtocol, Host};
+use crate::db::{node_info_from_row, open_db_connection, NODE_SELECT_COLUMNS};
 use crate::dnssec::{parse_dns_keys_dir, DnsSigningKey, RecordsToSign};
 
 use std::{
@@ -723,27 +723,11 @@ async fn fill_cache(
 
         // Get nodes from db
         let mut select_nodes = db_conn
-            .prepare("SELECT * FROM nodes WHERE try_count > 0")
+            .prepare(&format!(
+                "SELECT {NODE_SELECT_COLUMNS} FROM nodes WHERE try_count > 0"
+            ))
             .unwrap();
-        let node_iter = select_nodes
-            .query_map([], |r| {
-                Ok(NodeInfo::construct(
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    u64::from_be_bytes(r.get(4)?),
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                    r.get(8)?,
-                    r.get(9)?,
-                    r.get(10)?,
-                    r.get(11)?,
-                    r.get(12)?,
-                ))
-            })
-            .unwrap();
+        let node_iter = select_nodes.query_map([], node_info_from_row).unwrap();
 
         for node_res in node_iter {
             let node = node_res.unwrap().unwrap();

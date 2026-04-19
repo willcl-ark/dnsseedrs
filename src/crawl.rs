@@ -1,6 +1,10 @@
-use crate::common::{Host, NetStatus, NodeInfo};
+use crate::{
+    common::{Host, NetStatus, NodeInfo, NodeTransport},
+    db::{node_info_from_row, NODE_SELECT_COLUMNS},
+};
 
 use std::{
+    collections::VecDeque,
     error::Error,
     io::BufReader as StdBufReader,
     net::{IpAddr, SocketAddr},
@@ -41,7 +45,8 @@ const CRAWL_RETRY_WINDOW: time::Duration = time::Duration::from_secs(60 * 10);
 const MAX_IDLE_WAIT: time::Duration = time::Duration::from_secs(5);
 const MAX_ONION_CONCURRENCY: usize = 16;
 const MAX_I2P_CONCURRENCY: usize = 8;
-const RESERVATION_SCAN_BATCH: usize = 512;
+const LEASED_QUEUE_MULTIPLIER: usize = 8;
+const LEASED_QUEUE_LOW_WATERMARK_DIVISOR: usize = 4;
 const SOCKS5_TIMEOUT: time::Duration = time::Duration::from_secs(10);
 
 #[derive(Default)]
@@ -82,13 +87,6 @@ impl CrawlMinuteStats {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CrawlTransport {
-    Direct,
-    Onion,
-    I2P,
-}
-
 #[derive(Clone, Copy)]
 struct CrawlSlots {
     global: usize,
@@ -96,15 +94,16 @@ struct CrawlSlots {
     i2p: usize,
 }
 
+#[derive(Default)]
+struct LeasedNodeQueues {
+    direct: VecDeque<NodeInfo>,
+    onion: VecDeque<NodeInfo>,
+    i2p: VecDeque<NodeInfo>,
+}
+
 struct CrawlInfo {
     node_info: NodeInfo,
     age: u64,
-}
-
-struct ScannedNode {
-    row_address: String,
-    last_tried: u64,
-    transport: CrawlTransport,
 }
 
 enum CrawledNode {
@@ -824,179 +823,161 @@ fn proxy_concurrency_caps(crawl_threads: usize) -> (usize, usize) {
     )
 }
 
-fn crawl_transport(host: &Host) -> CrawlTransport {
-    match host {
-        Host::OnionV3(..) => CrawlTransport::Onion,
-        Host::I2P(..) => CrawlTransport::I2P,
-        Host::Ipv4(..) | Host::Ipv6(..) | Host::CJDNS(..) => CrawlTransport::Direct,
+fn queue_watermarks(concurrency: usize) -> (usize, usize) {
+    if concurrency == 0 {
+        return (0, 0);
     }
+    let high = concurrency.saturating_mul(LEASED_QUEUE_MULTIPLIER);
+    let low = (high / LEASED_QUEUE_LOW_WATERMARK_DIVISOR).max(1);
+    (low, high)
 }
 
-fn can_reserve_transport(slots: &CrawlSlots, transport: CrawlTransport) -> bool {
-    if slots.global == 0 {
-        return false;
+fn refill_queue_for_transport(
+    tx: &rusqlite::Transaction<'_>,
+    transport: NodeTransport,
+    queue: &mut VecDeque<NodeInfo>,
+    due_before: u64,
+    reservation_time: u64,
+    high_watermark: usize,
+) -> rusqlite::Result<()> {
+    let target = high_watermark.saturating_sub(queue.len());
+    if target == 0 {
+        return Ok(());
     }
 
-    match transport {
-        CrawlTransport::Direct => true,
-        CrawlTransport::Onion => slots.onion > 0,
-        CrawlTransport::I2P => slots.i2p > 0,
+    let mut select_nodes = tx.prepare(&format!(
+        "SELECT {NODE_SELECT_COLUMNS} FROM nodes
+         WHERE transport = ?
+           AND last_tried < ?
+         ORDER BY last_tried, address
+         LIMIT ?"
+    ))?;
+    let node_iter = select_nodes.query_map(
+        params![
+            transport.as_sql(),
+            due_before,
+            i64::try_from(target).unwrap()
+        ],
+        node_info_from_row,
+    )?;
+    let nodes = node_iter
+        .filter_map(|node| match node {
+            Ok(ni) => ni,
+            Err(..) => None,
+        })
+        .collect::<Vec<_>>();
+    drop(select_nodes);
+
+    let mut reserve_stmt = tx.prepare("UPDATE nodes SET last_tried = ? WHERE address = ?")?;
+    for node in &nodes {
+        reserve_stmt.execute(params![reservation_time, node.addr.to_string()])?;
     }
+    drop(reserve_stmt);
+
+    queue.extend(nodes);
+    Ok(())
 }
 
-fn reserve_transport_slot(slots: &mut CrawlSlots, transport: CrawlTransport) {
-    slots.global -= 1;
-    match transport {
-        CrawlTransport::Direct => (),
-        CrawlTransport::Onion => slots.onion -= 1,
-        CrawlTransport::I2P => slots.i2p -= 1,
-    }
-}
-
-fn scan_transport(address: &str) -> Option<CrawlTransport> {
-    // Nodes in the database have already passed full address validation, so the
-    // scan phase only needs to distinguish proxy-backed transports. Everything
-    // else, including IPv4/IPv6/CJDNS, uses direct connectivity.
-    let (host, _) = address.rsplit_once(':')?;
-    if host.len() == 62 && host.ends_with(".onion") {
-        return Some(CrawlTransport::Onion);
-    }
-    if host.len() == 60 && host.ends_with(".b32.i2p") {
-        return Some(CrawlTransport::I2P);
-    }
-    Some(CrawlTransport::Direct)
-}
-
-fn scan_node_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Option<ScannedNode>> {
-    let address: String = r.get(0)?;
-    let Some(transport) = scan_transport(&address) else {
-        return Ok(None);
-    };
-
-    Ok(Some(ScannedNode {
-        row_address: address,
-        last_tried: r.get(1)?,
-        transport,
-    }))
-}
-
-fn full_node_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Option<NodeInfo>> {
-    let address: String = r.get(0)?;
-    Ok(NodeInfo::construct(
-        address,
-        r.get(1)?,
-        r.get(2)?,
-        r.get(3)?,
-        u64::from_be_bytes(r.get(4)?),
-        r.get(5)?,
-        r.get(6)?,
-        r.get(7)?,
-        r.get(8)?,
-        r.get(9)?,
-        r.get(10)?,
-        r.get(11)?,
-        r.get(12)?,
-    )
-    .ok())
-}
-
-fn reserve_nodes_for_crawl(
+fn refill_leased_queues(
     conn: &mut Connection,
     due_before: u64,
     reservation_time: u64,
-    mut slots: CrawlSlots,
-) -> rusqlite::Result<Vec<NodeInfo>> {
-    if slots.global == 0 {
-        return Ok(Vec::new());
-    }
-
+    queues: &mut LeasedNodeQueues,
+    direct_bounds: (usize, usize),
+    onion_bounds: (usize, usize),
+    i2p_bounds: (usize, usize),
+) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
-    let mut cursor: Option<(u64, String)> = None;
-    let mut reserved_addresses = Vec::new();
-    while slots.global > 0 {
-        // Scan only the index-covered `(address, last_tried)` fields here so the
-        // reservation walk stays on the composite index; fetch full rows only for
-        // addresses that actually get reserved.
-        let batch = {
-            let mut select_next_nodes = match &cursor {
-                Some(..) => tx.prepare(
-                    "SELECT address, last_tried FROM nodes
-                     WHERE (last_tried, address) > (?, ?)
-                       AND last_tried < ?
-                     ORDER BY last_tried, address
-                     LIMIT ?",
-                )?,
-                None => tx.prepare(
-                    "SELECT address, last_tried FROM nodes
-                     WHERE last_tried < ?
-                     ORDER BY last_tried, address
-                     LIMIT ?",
-                )?,
-            };
-            let node_iter = match &cursor {
-                Some((last_tried, address)) => select_next_nodes.query_map(
-                    params![
-                        last_tried,
-                        address,
-                        due_before,
-                        i64::try_from(RESERVATION_SCAN_BATCH).unwrap()
-                    ],
-                    scan_node_from_row,
-                )?,
-                None => select_next_nodes.query_map(
-                    params![due_before, i64::try_from(RESERVATION_SCAN_BATCH).unwrap()],
-                    scan_node_from_row,
-                )?,
-            };
-            node_iter
-                .filter_map(|n| match n {
-                    Ok(ni) => ni,
-                    Err(..) => None,
-                })
-                .collect::<Vec<_>>()
-        };
-        if batch.is_empty() {
-            break;
-        }
-
-        if let Some(last_scanned) = batch.last() {
-            cursor = Some((last_scanned.last_tried, last_scanned.row_address.clone()));
-        }
-
-        for scanned_node in batch {
-            if !can_reserve_transport(&slots, scanned_node.transport) {
-                continue;
-            }
-            reserve_transport_slot(&mut slots, scanned_node.transport);
-            reserved_addresses.push(scanned_node.row_address);
-            if slots.global == 0 {
-                break;
-            }
-        }
+    if queues.onion.len() < onion_bounds.0 {
+        refill_queue_for_transport(
+            &tx,
+            NodeTransport::Onion,
+            &mut queues.onion,
+            due_before,
+            reservation_time,
+            onion_bounds.1,
+        )?;
     }
-
-    let mut nodes = Vec::with_capacity(reserved_addresses.len());
-    let mut fetch_node_stmt = tx.prepare("SELECT * FROM nodes WHERE address = ?")?;
-    for address in &reserved_addresses {
-        let Some(node) = fetch_node_stmt
-            .query_row(params![address], full_node_from_row)
-            .optional()?
-            .flatten()
-        else {
-            continue;
-        };
-        nodes.push(node);
+    if queues.i2p.len() < i2p_bounds.0 {
+        refill_queue_for_transport(
+            &tx,
+            NodeTransport::I2P,
+            &mut queues.i2p,
+            due_before,
+            reservation_time,
+            i2p_bounds.1,
+        )?;
     }
-    drop(fetch_node_stmt);
-
-    let mut reserve_stmt = tx.prepare("UPDATE nodes SET last_tried = ? WHERE address = ?")?;
-    for address in &reserved_addresses {
-        reserve_stmt.execute(params![reservation_time, address])?;
+    if queues.direct.len() < direct_bounds.0 {
+        refill_queue_for_transport(
+            &tx,
+            NodeTransport::Direct,
+            &mut queues.direct,
+            due_before,
+            reservation_time,
+            direct_bounds.1,
+        )?;
     }
-    drop(reserve_stmt);
     tx.commit()?;
+    Ok(())
+}
 
-    Ok(nodes)
+fn pop_queued_nodes(queues: &mut LeasedNodeQueues, slots: CrawlSlots) -> Vec<NodeInfo> {
+    let mut nodes = Vec::with_capacity(slots.global);
+    let onion_to_take = slots.onion.min(slots.global).min(queues.onion.len());
+    for _ in 0..onion_to_take {
+        nodes.push(queues.onion.pop_front().unwrap());
+    }
+
+    let remaining_after_onion = slots.global - nodes.len();
+    let i2p_to_take = slots.i2p.min(remaining_after_onion).min(queues.i2p.len());
+    for _ in 0..i2p_to_take {
+        nodes.push(queues.i2p.pop_front().unwrap());
+    }
+
+    let remaining_after_i2p = slots.global - nodes.len();
+    let direct_to_take = remaining_after_i2p.min(queues.direct.len());
+    for _ in 0..direct_to_take {
+        nodes.push(queues.direct.pop_front().unwrap());
+    }
+
+    nodes
+}
+
+async fn wait_for_queued_transport_slot(
+    queues: &LeasedNodeQueues,
+    onion_sem: &Arc<Semaphore>,
+    i2p_sem: &Arc<Semaphore>,
+) {
+    match (
+        !queues.onion.is_empty() && onion_sem.available_permits() == 0,
+        !queues.i2p.is_empty() && i2p_sem.available_permits() == 0,
+    ) {
+        (true, true) => {
+            tokio::select! {
+                permit = onion_sem.clone().acquire_owned() => drop(permit.unwrap()),
+                permit = i2p_sem.clone().acquire_owned() => drop(permit.unwrap()),
+            };
+        }
+        (true, false) => {
+            let permit = onion_sem.clone().acquire_owned().await.unwrap();
+            drop(permit);
+        }
+        (false, true) => {
+            let permit = i2p_sem.clone().acquire_owned().await.unwrap();
+            drop(permit);
+        }
+        (false, false) => (),
+    }
+}
+
+fn queue_has_blocked_proxy_work(
+    queues: &LeasedNodeQueues,
+    onion_sem: &Arc<Semaphore>,
+    i2p_sem: &Arc<Semaphore>,
+) -> bool {
+    (!queues.onion.is_empty() && onion_sem.available_permits() == 0)
+        || (!queues.i2p.is_empty() && i2p_sem.available_permits() == 0)
 }
 
 fn next_crawl_delay(
@@ -1114,15 +1095,34 @@ pub async fn crawler_thread(
 
     // Semaphore to limit how many tasks are spawned
     let sem = Arc::new(Semaphore::new(threads));
-    let (onion_cap, i2p_cap) = proxy_concurrency_caps(threads);
+    let (mut onion_cap, mut i2p_cap) = proxy_concurrency_caps(threads);
+    if net_status.onion_proxy.is_none() {
+        onion_cap = 0;
+    }
+    if net_status.i2p_proxy.is_none() {
+        i2p_cap = 0;
+    }
     let onion_sem = Arc::new(Semaphore::new(onion_cap));
     let i2p_sem = Arc::new(Semaphore::new(i2p_cap));
+    let direct_queue_bounds = queue_watermarks(threads);
+    let onion_queue_bounds = queue_watermarks(onion_cap);
+    let i2p_queue_bounds = queue_watermarks(i2p_cap);
     info!(
         "Crawl concurrency caps: crawl={}, onion={}, i2p={}",
         threads, onion_cap, i2p_cap
     );
+    info!(
+        "Crawl queue watermarks: direct={}/{}, onion={}/{}, i2p={}/{}",
+        direct_queue_bounds.0,
+        direct_queue_bounds.1,
+        onion_queue_bounds.0,
+        onion_queue_bounds.1,
+        i2p_queue_bounds.0,
+        i2p_queue_bounds.1
+    );
     let stats = Arc::new(CrawlMinuteStats::default());
     tokio::spawn(log_crawl_stats(stats.clone()));
+    let mut leased_queues = LeasedNodeQueues::default();
 
     // Crawler loop
     loop {
@@ -1138,22 +1138,32 @@ pub async fn crawler_thread(
             .unwrap()
             .as_secs();
         let due_before = now.saturating_sub(CRAWL_RETRY_WINDOW.as_secs());
-        let nodes = {
+        {
             let mut locked_db_conn = db_conn.lock().unwrap();
-            reserve_nodes_for_crawl(
+            refill_leased_queues(
                 &mut locked_db_conn,
                 due_before,
                 now,
-                CrawlSlots {
-                    global: available_permits,
-                    onion: onion_sem.available_permits(),
-                    i2p: i2p_sem.available_permits(),
-                },
+                &mut leased_queues,
+                direct_queue_bounds,
+                onion_queue_bounds,
+                i2p_queue_bounds,
             )
             .unwrap()
+        }
+
+        let slots = CrawlSlots {
+            global: available_permits,
+            onion: onion_sem.available_permits(),
+            i2p: i2p_sem.available_permits(),
         };
+        let nodes = pop_queued_nodes(&mut leased_queues, slots);
 
         if nodes.is_empty() {
+            if queue_has_blocked_proxy_work(&leased_queues, &onion_sem, &i2p_sem) {
+                wait_for_queued_transport_slot(&leased_queues, &onion_sem, &i2p_sem).await;
+                continue;
+            }
             let delay = {
                 let locked_db_conn = db_conn.lock().unwrap();
                 next_crawl_delay(&locked_db_conn, now, CRAWL_RETRY_WINDOW, MAX_IDLE_WAIT).unwrap()
@@ -1175,10 +1185,10 @@ pub async fn crawler_thread(
             let i2p_sem_clone = i2p_sem.clone();
             let stats_c = stats.clone();
             let permit = sem_clone.acquire_owned().await.unwrap();
-            let proxy_permit = match crawl_transport(&node.addr.host) {
-                CrawlTransport::Direct => None,
-                CrawlTransport::Onion => Some(onion_sem_clone.acquire_owned().await.unwrap()),
-                CrawlTransport::I2P => Some(i2p_sem_clone.acquire_owned().await.unwrap()),
+            let proxy_permit = match NodeTransport::from_host(&node.addr.host) {
+                NodeTransport::Direct => None,
+                NodeTransport::Onion => Some(onion_sem_clone.acquire_owned().await.unwrap()),
+                NodeTransport::I2P => Some(i2p_sem_clone.acquire_owned().await.unwrap()),
             };
 
             // Crawler task
@@ -1331,10 +1341,22 @@ pub async fn crawler_thread(
                                 .unwrap();
                         }
                         CrawledNode::NewNode(info) => {
-                            locked_db_conn.execute(
-                                "INSERT OR IGNORE INTO nodes VALUES(?, 0, 0, '', ?, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0)",
-                                params![&info.node_info.addr.to_string(), info.node_info.services.to_be_bytes()]
-                            ).unwrap();
+                            locked_db_conn
+                                .execute(
+                                    "INSERT OR IGNORE INTO nodes (
+                                    address, last_tried, last_seen, user_agent, services,
+                                    starting_height, protocol_version, try_count,
+                                    reliability_2h, reliability_8h, reliability_1d,
+                                    reliability_1w, reliability_1m, transport
+                                ) VALUES(?, 0, 0, '', ?, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, ?)",
+                                    params![
+                                        &info.node_info.addr.to_string(),
+                                        info.node_info.services.to_be_bytes(),
+                                        NodeTransport::from_host(&info.node_info.addr.host)
+                                            .as_sql(),
+                                    ],
+                                )
+                                .unwrap();
                         }
                     }
                 }
@@ -1353,9 +1375,10 @@ pub async fn crawler_thread(
 #[cfg(test)]
 mod tests {
     use super::{
-        next_crawl_delay, proxy_concurrency_caps, reserve_nodes_for_crawl, scan_transport,
-        CrawlSlots, CrawlTransport, RESERVATION_SCAN_BATCH,
+        next_crawl_delay, pop_queued_nodes, proxy_concurrency_caps, queue_watermarks,
+        refill_leased_queues, CrawlSlots, LeasedNodeQueues,
     };
+    use crate::common::NodeTransport;
     use rusqlite::{params, Connection};
     use std::time::Duration;
 
@@ -1375,13 +1398,16 @@ mod tests {
                 reliability_8h REAL NOT NULL,
                 reliability_1d REAL NOT NULL,
                 reliability_1w REAL NOT NULL,
-                reliability_1m REAL NOT NULL
+                reliability_1m REAL NOT NULL,
+                transport INTEGER NOT NULL
             )",
             [],
         )
         .unwrap();
+        conn.execute("CREATE INDEX idx_nodes_last_tried ON nodes(last_tried)", [])
+            .unwrap();
         conn.execute(
-            "CREATE INDEX idx_nodes_last_tried_address ON nodes(last_tried, address)",
+            "CREATE INDEX idx_nodes_transport_last_tried_address ON nodes(transport, last_tried, address)",
             [],
         )
         .unwrap();
@@ -1390,34 +1416,42 @@ mod tests {
 
     fn insert_node(conn: &Connection, address: &str, last_tried: u64) {
         conn.execute(
-            "INSERT INTO nodes VALUES(?, ?, 0, '', ?, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0)",
-            params![address, last_tried, 0_u64.to_be_bytes()],
+            "INSERT INTO nodes (
+                address, last_tried, last_seen, user_agent, services, starting_height,
+                protocol_version, try_count, reliability_2h, reliability_8h,
+                reliability_1d, reliability_1w, reliability_1m, transport
+            ) VALUES(?, ?, 0, '', ?, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, ?)",
+            params![
+                address,
+                last_tried,
+                0_u64.to_be_bytes(),
+                NodeTransport::from_address(address).unwrap().as_sql()
+            ],
         )
         .unwrap();
     }
 
     #[test]
-    fn reserve_nodes_for_crawl_respects_order_and_limit() {
+    fn refill_leased_queues_respects_order_and_limit() {
         let mut conn = setup_conn();
         insert_node(&conn, "1.1.1.1:8333", 10);
         insert_node(&conn, "8.8.8.8:8333", 20);
         insert_node(&conn, "9.9.9.9:8333", 30);
+        let mut queues = LeasedNodeQueues::default();
 
-        let reserved = reserve_nodes_for_crawl(
-            &mut conn,
-            25,
-            100,
+        refill_leased_queues(&mut conn, 25, 100, &mut queues, (1, 2), (0, 0), (0, 0)).unwrap();
+        let leased = pop_queued_nodes(
+            &mut queues,
             CrawlSlots {
                 global: 2,
                 onion: 0,
                 i2p: 0,
             },
-        )
-        .unwrap();
-        let reserved_addrs: Vec<_> = reserved.iter().map(|node| node.addr.to_string()).collect();
+        );
+        let leased_addrs: Vec<_> = leased.iter().map(|node| node.addr.to_string()).collect();
 
         assert_eq!(
-            reserved_addrs,
+            leased_addrs,
             vec!["1.1.1.1:8333".to_string(), "8.8.8.8:8333".to_string()]
         );
 
@@ -1449,7 +1483,7 @@ mod tests {
     }
 
     #[test]
-    fn reserve_nodes_for_crawl_respects_proxy_caps() {
+    fn pop_queued_nodes_respects_proxy_caps() {
         let mut conn = setup_conn();
         insert_node(
             &conn,
@@ -1462,131 +1496,63 @@ mod tests {
             20,
         );
         insert_node(&conn, "1.1.1.1:8333", 30);
+        let mut queues = LeasedNodeQueues::default();
 
-        let reserved = reserve_nodes_for_crawl(
-            &mut conn,
-            40,
-            100,
+        refill_leased_queues(&mut conn, 40, 100, &mut queues, (1, 1), (1, 1), (1, 1)).unwrap();
+        let leased = pop_queued_nodes(
+            &mut queues,
             CrawlSlots {
                 global: 3,
                 onion: 0,
                 i2p: 1,
             },
-        )
-        .unwrap();
-        let reserved_addrs: Vec<_> = reserved.iter().map(|node| node.addr.to_string()).collect();
+        );
+        let leased_addrs: Vec<_> = leased.iter().map(|node| node.addr.to_string()).collect();
 
         assert_eq!(
-            reserved_addrs,
+            leased_addrs,
             vec![
                 "udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p:8333".to_string(),
                 "1.1.1.1:8333".to_string(),
             ]
         );
+        assert_eq!(queues.onion.len(), 1);
     }
 
     #[test]
-    fn reserve_nodes_for_crawl_scans_past_skipped_batches() {
-        let mut conn = setup_conn();
-        for i in 0..=RESERVATION_SCAN_BATCH {
-            let suffix = [
-                char::from(b'a' + u8::try_from(i / 26).unwrap()),
-                char::from(b'a' + u8::try_from(i % 26).unwrap()),
-            ];
-            let host = format!(
-                "{}{}.onion",
-                "a".repeat(54),
-                suffix.iter().collect::<String>()
-            );
-            insert_node(&conn, &format!("{host}:8333"), 10);
-        }
-        insert_node(&conn, "1.1.1.1:8333", 11);
-
-        let reserved = reserve_nodes_for_crawl(
-            &mut conn,
-            20,
-            100,
-            CrawlSlots {
-                global: 1,
-                onion: 0,
-                i2p: 0,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(reserved.len(), 1);
-        assert_eq!(reserved[0].addr.to_string(), "1.1.1.1:8333");
-    }
-
-    #[test]
-    fn reserve_nodes_for_crawl_keeps_scanning_same_timestamp_batches() {
-        let mut conn = setup_conn();
-        for i in 0..600 {
-            insert_node(&conn, &format!("11.{}.{}.1:8333", i / 256, i % 256), 10);
-        }
-
-        let reserved = reserve_nodes_for_crawl(
-            &mut conn,
-            20,
-            100,
-            CrawlSlots {
-                global: 600,
-                onion: 0,
-                i2p: 0,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(reserved.len(), 600);
-    }
-
-    #[test]
-    fn reserve_nodes_scan_query_uses_covering_index() {
+    fn refill_query_uses_transport_index() {
         let conn = setup_conn();
         let plan_rows = conn
             .prepare(
                 "EXPLAIN QUERY PLAN
                  SELECT address, last_tried FROM nodes
-                 WHERE (last_tried, address) > (?, ?)
+                 WHERE transport = ?
                    AND last_tried < ?
                  ORDER BY last_tried, address
                  LIMIT ?",
             )
             .unwrap()
-            .query_map(params![0_u64, "", 100_u64, 1_i64], |row| {
-                row.get::<usize, String>(3)
-            })
+            .query_map(
+                params![NodeTransport::Direct.as_sql(), 100_u64, 1_i64],
+                |row| row.get::<usize, String>(3),
+            )
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
         assert!(plan_rows
             .iter()
-            .any(|detail| detail.contains("idx_nodes_last_tried_address")));
+            .any(|detail| detail.contains("idx_nodes_transport_last_tried_address")));
         assert!(plan_rows
             .iter()
-            .any(|detail| detail.contains("COVERING INDEX")));
-        assert!(plan_rows
-            .iter()
-            .any(|detail| detail.contains("(last_tried,address)>(?,?)")));
+            .any(|detail| detail.contains("transport=? AND last_tried<?")));
     }
 
     #[test]
-    fn scan_transport_classifies_proxy_addresses_without_full_parse() {
-        assert_eq!(scan_transport("1.1.1.1:8333"), Some(CrawlTransport::Direct));
-        assert_eq!(
-            scan_transport("[2602:100:abcd::1]:8333"),
-            Some(CrawlTransport::Direct)
-        );
-        assert_eq!(
-            scan_transport("duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion:8333"),
-            Some(CrawlTransport::Onion)
-        );
-        assert_eq!(
-            scan_transport("udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p:8333"),
-            Some(CrawlTransport::I2P)
-        );
-        assert_eq!(scan_transport("not-an-address"), None);
+    fn queue_watermarks_scale_with_concurrency() {
+        assert_eq!(queue_watermarks(0), (0, 0));
+        assert_eq!(queue_watermarks(1), (2, 8));
+        assert_eq!(queue_watermarks(16), (32, 128));
     }
 
     #[test]

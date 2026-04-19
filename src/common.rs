@@ -22,6 +22,35 @@ pub struct NodeAddress {
     pub port: u16,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum NodeTransport {
+    Direct,
+    Onion,
+    I2P,
+}
+
+impl NodeTransport {
+    pub fn from_host(host: &Host) -> Self {
+        match host {
+            Host::OnionV3(..) => Self::Onion,
+            Host::I2P(..) => Self::I2P,
+            Host::Ipv4(..) | Host::Ipv6(..) | Host::CJDNS(..) => Self::Direct,
+        }
+    }
+
+    pub fn from_address(addr: &str) -> Result<Self, &'static str> {
+        Ok(Self::from_host(&parse_address(addr)?.host))
+    }
+
+    pub fn as_sql(self) -> i64 {
+        match self {
+            Self::Direct => 0,
+            Self::Onion => 1,
+            Self::I2P => 2,
+        }
+    }
+}
+
 impl std::fmt::Display for NodeAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.host {

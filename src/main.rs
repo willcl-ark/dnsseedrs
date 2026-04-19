@@ -177,8 +177,8 @@ async fn main() {
     let server_name = args.server_name.clone();
     let soa_rname = args.soa_rname.clone();
     let dnssec_keys = args.dnssec_keys.clone();
-    let db_conn = open_db_connection(&db_file);
-    initialize_database(&db_conn, &args.seednode);
+    let mut db_conn = open_db_connection(&db_file);
+    initialize_database(&mut db_conn, &args.seednode);
     let crawl_db_conn = Arc::new(Mutex::new(db_conn));
 
     // Start crawler threads
