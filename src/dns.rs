@@ -30,10 +30,14 @@ use domain::{
     sign::{key::SigningKey, records::FamilyName},
 };
 use log::{debug, info};
-use rand::{seq::SliceRandom, thread_rng};
+use rand::{
+    seq::{index::sample, SliceRandom},
+    thread_rng, Rng,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     net::{TcpListener, UdpSocket},
+    sync::Semaphore,
     time::{interval, timeout},
 };
 
@@ -41,6 +45,9 @@ const IPV4_NET_GROUP_MASK: Ipv4Addr = Ipv4Addr::from_octets([0xff, 0xff, 0, 0]);
 const IPV6_NET_GROUP_MASK: Ipv6Addr = Ipv6Addr::from_segments([0xffff, 0xffff, 0, 0, 0, 0, 0, 0]);
 const IPV6_HE_NET_GROUP_MASK: Ipv6Addr =
     Ipv6Addr::from_segments([0xffff, 0xffff, 0xf000, 0, 0, 0, 0, 0]);
+const MAX_DNS_RESULTS: usize = 20;
+const UDP_HANDLER_CONCURRENCY: usize = 1024;
+const TCP_HANDLER_CONCURRENCY: usize = 256;
 
 #[derive(Clone)]
 struct CachedAddrs {
@@ -55,6 +62,19 @@ impl CachedAddrs {
             ipv6: vec![],
         }
     }
+}
+
+fn sample_cached_addrs<T: Copy>(addrs: &[T], limit: usize, rng: &mut impl Rng) -> Vec<T> {
+    if addrs.len() <= limit {
+        let mut all = addrs.to_vec();
+        all.shuffle(rng);
+        return all;
+    }
+
+    sample(rng, addrs.len(), limit)
+        .into_iter()
+        .map(|i| addrs[i])
+        .collect()
 }
 
 struct SeederInfo {
@@ -457,28 +477,18 @@ async fn process_dns_request(
             }
         };
 
-        // Read from cache
-        let read_addrs_opt: Option<CachedAddrs>;
-        {
-            let cache_read = cache.read().unwrap();
-            read_addrs_opt = cache_read.get(&filter).cloned();
-        }
-        if read_addrs_opt.is_none() {
-            continue;
-        }
-
-        let mut read_addrs = read_addrs_opt.unwrap();
-
-        // Shuffle addresses and truncate to 20 before returning them
         let mut rng = thread_rng();
-        read_addrs.ipv4.shuffle(&mut rng);
-        read_addrs.ipv4.truncate(20);
-        read_addrs.ipv6.shuffle(&mut rng);
-        read_addrs.ipv6.truncate(20);
 
         match question.qtype() {
             Rtype::A => {
-                for node in read_addrs.ipv4 {
+                let selected = {
+                    let cache_read = cache.read().unwrap();
+                    let Some(read_addrs) = cache_read.get(&filter) else {
+                        continue;
+                    };
+                    sample_cached_addrs(&read_addrs.ipv4, MAX_DNS_RESULTS, &mut rng)
+                };
+                for node in selected {
                     let rec = Record::new(
                         name.to_name::<Vec<u8>>(),
                         Class::IN,
@@ -490,7 +500,14 @@ async fn process_dns_request(
                 }
             }
             Rtype::AAAA => {
-                for node in read_addrs.ipv6 {
+                let selected = {
+                    let cache_read = cache.read().unwrap();
+                    let Some(read_addrs) = cache_read.get(&filter) else {
+                        continue;
+                    };
+                    sample_cached_addrs(&read_addrs.ipv6, MAX_DNS_RESULTS, &mut rng)
+                };
+                for node in selected {
                     let rec = Record::new(
                         name.to_name::<Vec<u8>>(),
                         Class::IN,
@@ -563,6 +580,7 @@ async fn dns_socket_task(
     if proto == BindProtocol::Udp {
         // Bind UDP socket
         let udp_sock = Arc::new(UdpSocket::bind(bind).await.unwrap());
+        let handler_sem = Arc::new(Semaphore::new(UDP_HANDLER_CONCURRENCY));
         info!("Bound UDP socket {}", udp_sock.local_addr().unwrap());
 
         // Main loop
@@ -573,7 +591,9 @@ async fn dns_socket_task(
             let udp_sock_clone = udp_sock.clone();
             let seeder_clone = seeder.clone();
             let cache_clone = cache.clone();
+            let handler_permit = handler_sem.clone().acquire_owned().await.unwrap();
             tokio::spawn(async move {
+                let _handler_permit = handler_permit;
                 match process_dns_request(&buf, req_len, seeder_clone.clone(), cache_clone.clone())
                     .await
                 {
@@ -590,6 +610,7 @@ async fn dns_socket_task(
     } else if proto == BindProtocol::Tcp {
         // Bind TCP Socket
         let tcp_sock = TcpListener::bind(bind).await.unwrap();
+        let handler_sem = Arc::new(Semaphore::new(TCP_HANDLER_CONCURRENCY));
         info!("Bound TCP socket {}", tcp_sock.local_addr().unwrap());
 
         // Main loop
@@ -598,7 +619,9 @@ async fn dns_socket_task(
 
             let seeder_clone = seeder.clone();
             let cache_clone = cache.clone();
+            let handler_permit = handler_sem.clone().acquire_owned().await.unwrap();
             tokio::spawn(async move {
+                let _handler_permit = handler_permit;
                 let (mut read_sock, mut write_sock) = tcp_stream.split();
                 let mut reader = BufReader::new(&mut read_sock);
                 let mut writer = BufWriter::new(&mut write_sock);
@@ -841,4 +864,29 @@ pub async fn dns_thread(
     // Use this task for the last bind
     let (proto, bind) = binds.pop().unwrap();
     dns_socket_task(proto, bind, seeder, cache).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sample_cached_addrs;
+    use rand::{rngs::StdRng, SeedableRng};
+    use std::collections::HashSet;
+
+    #[test]
+    fn sample_cached_addrs_returns_all_items_when_under_limit() {
+        let mut rng = StdRng::seed_from_u64(1);
+        let mut sampled = sample_cached_addrs(&[1_u8, 2, 3], 20, &mut rng);
+        sampled.sort_unstable();
+        assert_eq!(sampled, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn sample_cached_addrs_returns_unique_subset() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let sampled = sample_cached_addrs(&(0_u8..100).collect::<Vec<_>>(), 20, &mut rng);
+        assert_eq!(sampled.len(), 20);
+        let unique = sampled.iter().copied().collect::<HashSet<_>>();
+        assert_eq!(unique.len(), 20);
+        assert!(sampled.iter().all(|v| *v < 100));
+    }
 }
