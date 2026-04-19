@@ -2,6 +2,7 @@ use crate::common::parse_address;
 
 use std::time::Duration;
 
+use log::warn;
 use rusqlite::{params, Connection};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -80,7 +81,7 @@ pub fn initialize_database(conn: &Connection, seednodes: &[String]) {
 
     let mut del_stmt = conn.prepare("DELETE FROM nodes WHERE address = ?").unwrap();
     for addr in invalid_nodes {
-        println!("Deleting invalid node {}", addr);
+        warn!("Deleting invalid node {}", addr);
         del_stmt.execute(params![addr]).unwrap();
     }
 }

@@ -5,7 +5,10 @@ use std::{
     io::BufReader as StdBufReader,
     net::{IpAddr, SocketAddr},
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time,
 };
 
@@ -24,18 +27,56 @@ use bitcoin::{
         Magic, ServiceFlags,
     },
 };
+use log::{debug, info, warn};
 use rusqlite::{params, Connection, OptionalExtension};
 use sha3::{Digest, Sha3_256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader as AsyncBufReader},
     net::TcpStream,
     sync::Semaphore,
-    time::sleep,
-    time::timeout,
+    time::{interval, sleep, timeout},
 };
 
 const CRAWL_RETRY_WINDOW: time::Duration = time::Duration::from_secs(60 * 10);
 const MAX_IDLE_WAIT: time::Duration = time::Duration::from_secs(5);
+
+#[derive(Default)]
+struct CrawlMinuteStats {
+    attempts: AtomicU64,
+    successes: AtomicU64,
+    failures: AtomicU64,
+    new_addrs: AtomicU64,
+}
+
+impl CrawlMinuteStats {
+    fn record_attempt(&self) {
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_result(&self, addrs: &[CrawledNode]) {
+        let mut success = false;
+        let mut failed = false;
+        let mut new_addrs = 0_u64;
+
+        for crawled in addrs {
+            match crawled {
+                CrawledNode::Failed(..) => failed = true,
+                CrawledNode::UpdatedInfo(..) => success = true,
+                CrawledNode::NewNode(..) => new_addrs += 1,
+            }
+        }
+
+        if success {
+            self.successes.fetch_add(1, Ordering::Relaxed);
+        }
+        if failed {
+            self.failures.fetch_add(1, Ordering::Relaxed);
+        }
+        if new_addrs > 0 {
+            self.new_addrs.fetch_add(new_addrs, Ordering::Relaxed);
+        }
+    }
+}
 
 struct CrawlInfo {
     node_info: NodeInfo,
@@ -268,7 +309,7 @@ async fn get_node_addrs_v1(
                 }));
             }
             NetworkMessage::Addr(addrs) => {
-                println!("Received addrv1 from {}", &node.addr.to_string());
+                debug!("Received addrv1 from {}", &node.addr.to_string());
                 for (_, a) in addrs {
                     if let Ok(s) = a.socket_addr() {
                         if let Ok(mut new_info) = NodeInfo::new(s.to_string()) {
@@ -283,7 +324,7 @@ async fn get_node_addrs_v1(
                 break;
             }
             NetworkMessage::AddrV2(addrs) => {
-                println!("Received addrv2 from {}", &node.addr.to_string());
+                debug!("Received addrv2 from {}", &node.addr.to_string());
                 for a in addrs {
                     let addrstr = match a.addr {
                         AddrV2::Ipv4(..) | AddrV2::Ipv6(..) => match a.socket_addr() {
@@ -329,7 +370,7 @@ async fn get_node_addrs_v1(
                                 }));
                             }
                         }
-                        Err(e) => println!("Error: {e}"),
+                        Err(e) => debug!("Error: {e}"),
                     }
                 }
                 break;
@@ -411,7 +452,7 @@ async fn get_node_addrs_v2(
     {
         Ok(p) => p,
         Err(e) => {
-            println!("V2 Connection failed {}", e);
+            debug!("V2 Connection failed {}", e);
             return Err(Box::new(V2ConnectError {}));
         }
     };
@@ -473,7 +514,7 @@ async fn get_node_addrs_v2(
                 }));
             }
             NetworkMessage::Addr(addrs) => {
-                println!("Received addrv1 from {}", &node.addr.to_string());
+                debug!("Received addrv1 from {}", &node.addr.to_string());
                 for (_, a) in addrs {
                     if let Ok(s) = a.socket_addr() {
                         if let Ok(mut new_info) = NodeInfo::new(s.to_string()) {
@@ -488,7 +529,7 @@ async fn get_node_addrs_v2(
                 break;
             }
             NetworkMessage::AddrV2(addrs) => {
-                println!("Received addrv2 from {}", &node.addr.to_string());
+                debug!("Received addrv2 from {}", &node.addr.to_string());
                 for a in addrs {
                     let addrstr = match a.addr {
                         AddrV2::Ipv4(..) | AddrV2::Ipv6(..) => match a.socket_addr() {
@@ -534,7 +575,7 @@ async fn get_node_addrs_v2(
                                 }));
                             }
                         }
-                        Err(e) => println!("Error: {e}"),
+                        Err(e) => debug!("Error: {e}"),
                     }
                 }
                 break;
@@ -618,7 +659,7 @@ async fn crawl_node(node: &NodeInfo, net_status: NetStatus) -> Vec<CrawledNode> 
     let age = tried_timestamp - node.last_tried;
     let mut ret_addrs = Vec::<CrawledNode>::new();
 
-    println!(
+    debug!(
         "Trying {}, current try = {}",
         &node.addr.to_string(),
         node.try_count + 1
@@ -627,18 +668,18 @@ async fn crawl_node(node: &NodeInfo, net_status: NetStatus) -> Vec<CrawledNode> 
     let v2_conn_res = connect_node(node, &net_status).await;
     if let Err(v2_conn_err) = v2_conn_res {
         if v2_conn_err.is::<NetNotAvailableError>() {
-            println!("Network not available for {}", &node.addr.to_string());
+            debug!("Network not available for {}", &node.addr.to_string());
         } else {
             let mut node_info = node.clone();
             node_info.last_tried = tried_timestamp;
             ret_addrs.push(CrawledNode::Failed(CrawlInfo { node_info, age }));
-            println!("Failed connect: {}", &node.addr.to_string());
+            debug!("Failed connect: {}", &node.addr.to_string());
         }
         return ret_addrs;
     }
     let mut v2_sock = v2_conn_res.unwrap();
 
-    println!("Connected to {} for v2 crawl", &node.addr.to_string());
+    debug!("Connected to {} for v2 crawl", &node.addr.to_string());
 
     match timeout(
         time::Duration::from_secs(30),
@@ -653,14 +694,14 @@ async fn crawl_node(node: &NodeInfo, net_status: NetStatus) -> Vec<CrawledNode> 
                     let mut node_info = node.clone();
                     node_info.last_tried = tried_timestamp;
                     ret_addrs.push(CrawledNode::Failed(CrawlInfo { node_info, age }));
-                    println!("Failed crawl: {}, {}", &node.addr.to_string(), v2_err);
+                    debug!("Failed crawl: {}, {}", &node.addr.to_string(), v2_err);
                     v2_sock.shutdown().await.unwrap();
                     return ret_addrs;
                 }
             }
         },
         Err(_) => {
-            println!("{} v2 connection timed out", &node.addr.to_string());
+            debug!("{} v2 connection timed out", &node.addr.to_string());
         }
     };
     v2_sock.shutdown().await.unwrap();
@@ -672,12 +713,12 @@ async fn crawl_node(node: &NodeInfo, net_status: NetStatus) -> Vec<CrawledNode> 
             let mut node_info = node.clone();
             node_info.last_tried = tried_timestamp;
             ret_addrs.push(CrawledNode::Failed(CrawlInfo { node_info, age }));
-            println!("Failed connect: {}", &node.addr.to_string());
+            debug!("Failed connect: {}", &node.addr.to_string());
             return ret_addrs;
         }
         let mut v1_sock = v1_conn_res.unwrap();
 
-        println!("Connected to {} for v1 crawl", &node.addr.to_string());
+        debug!("Connected to {} for v1 crawl", &node.addr.to_string());
 
         match timeout(
             time::Duration::from_secs(30),
@@ -691,13 +732,13 @@ async fn crawl_node(node: &NodeInfo, net_status: NetStatus) -> Vec<CrawledNode> 
                     let mut node_info = node.clone();
                     node_info.last_tried = tried_timestamp;
                     ret_addrs.push(CrawledNode::Failed(CrawlInfo { node_info, age }));
-                    println!("Failed crawl: {}, {}", &node.addr.to_string(), v1_err);
+                    debug!("Failed crawl: {}, {}", &node.addr.to_string(), v1_err);
                     v1_sock.shutdown().await.unwrap();
                     return ret_addrs;
                 }
             },
             Err(_) => {
-                println!("{} v1 connection timed out", &node.addr.to_string());
+                debug!("{} v1 connection timed out", &node.addr.to_string());
                 let mut node_info = node.clone();
                 node_info.last_tried = tried_timestamp;
                 ret_addrs.push(CrawledNode::Failed(CrawlInfo { node_info, age }));
@@ -708,7 +749,7 @@ async fn crawl_node(node: &NodeInfo, net_status: NetStatus) -> Vec<CrawledNode> 
         v1_sock.shutdown().await.unwrap();
     }
 
-    println!("Done {}", &node.addr.to_string());
+    debug!("Done {}", &node.addr.to_string());
     ret_addrs
 }
 
@@ -796,13 +837,30 @@ fn next_crawl_delay(
     Ok(time::Duration::from_secs(next_due - now).min(max_idle_wait))
 }
 
+async fn log_crawl_stats(stats: Arc<CrawlMinuteStats>) {
+    let mut stats_interval = interval(time::Duration::from_secs(60));
+    stats_interval.tick().await;
+    loop {
+        stats_interval.tick().await;
+        let attempts = stats.attempts.swap(0, Ordering::Relaxed);
+        let successes = stats.successes.swap(0, Ordering::Relaxed);
+        let failures = stats.failures.swap(0, Ordering::Relaxed);
+        let new_addrs = stats.new_addrs.swap(0, Ordering::Relaxed);
+
+        info!(
+            "attempted={}, succeeded={}, failed={}, new_addrs={}",
+            attempts, successes, failures, new_addrs
+        );
+    }
+}
+
 pub async fn crawler_thread(
     db_conn: Arc<Mutex<rusqlite::Connection>>,
     threads: usize,
     mut net_status: NetStatus,
 ) {
     // Check proxies
-    println!("Checking onion proxy");
+    info!("Checking onion proxy");
     {
         let mut onion_proxy_check = timeout(
             time::Duration::from_secs(10),
@@ -829,11 +887,11 @@ pub async fn crawler_thread(
         }
     }
     match net_status.onion_proxy {
-        Some(..) => println!("Onion proxy good"),
-        None => println!("Onion proxy bad"),
+        Some(..) => info!("Onion proxy good"),
+        None => warn!("Onion proxy bad"),
     }
 
-    println!("Checking I2P proxy");
+    info!("Checking I2P proxy");
     {
         let mut i2p_proxy_check = timeout(
             time::Duration::from_secs(10),
@@ -853,21 +911,23 @@ pub async fn crawler_thread(
             .is_err()
             {
                 net_status.i2p_proxy = None;
-                println!("I2P proxy couldn't connect to test server");
+                warn!("I2P proxy couldn't connect to test server");
             }
             i2p_proxy_check.unwrap().shutdown().await.unwrap();
         } else {
-            println!("I2P proxy didn't connect");
+            warn!("I2P proxy didn't connect");
             net_status.i2p_proxy = None;
         }
     }
     match net_status.i2p_proxy {
-        Some(..) => println!("I2P proxy good"),
-        None => println!("I2P proxy bad"),
+        Some(..) => info!("I2P proxy good"),
+        None => warn!("I2P proxy bad"),
     }
 
     // Semaphore to limit how many tasks are spawned
     let sem = Arc::new(Semaphore::new(threads));
+    let stats = Arc::new(CrawlMinuteStats::default());
+    tokio::spawn(log_crawl_stats(stats.clone()));
 
     // Crawler loop
     loop {
@@ -904,16 +964,19 @@ pub async fn crawler_thread(
             let net_status_c: NetStatus = net_status.clone();
             let f_db_conn = db_conn.clone();
             let sem_clone = Arc::clone(&sem);
+            let stats_c = stats.clone();
             let permit = sem_clone.acquire_owned().await.unwrap();
 
             // Crawler task
             tokio::spawn(async move {
                 let _permit = permit;
+                stats_c.record_attempt();
                 let addrs = crawl_node(&node, net_status_c).await;
+                stats_c.record_result(&addrs);
                 let six_months = time::Duration::from_secs(60 * 60 * 24 * 183);
 
                 /*
-                println!(
+                debug!(
                     "Crawler thread - {}: Waiting for database",
                     &node.addr.to_string()
                 );
@@ -932,7 +995,7 @@ pub async fn crawler_thread(
                                     >= six_months)
                                 || (node.last_seen == 0 && node.try_count > 10)
                             {
-                                println!("Deleting {} from database", info.node_info.addr);
+                                debug!("Deleting {} from database", info.node_info.addr);
                                 locked_db_conn
                                     .execute(
                                         "
@@ -1062,7 +1125,7 @@ pub async fn crawler_thread(
                 }
                 locked_db_conn.execute("COMMIT TRANSACTION", []).unwrap();
                 /*
-                println!(
+                debug!(
                     "Crawler thread - {}: Done with database",
                     &node.addr.to_string()
                 );

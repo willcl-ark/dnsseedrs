@@ -29,6 +29,7 @@ use domain::{
     },
     sign::{key::SigningKey, records::FamilyName},
 };
+use log::{debug, info};
 use rand::{seq::SliceRandom, thread_rng};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
@@ -562,7 +563,7 @@ async fn dns_socket_task(
     if proto == BindProtocol::Udp {
         // Bind UDP socket
         let udp_sock = Arc::new(UdpSocket::bind(bind).await.unwrap());
-        println!("Bound UDP socket {}", udp_sock.local_addr().unwrap());
+        info!("Bound UDP socket {}", udp_sock.local_addr().unwrap());
 
         // Main loop
         loop {
@@ -582,14 +583,14 @@ async fn dns_socket_task(
                             let _ = udp_sock_clone.send_to(msg.as_slice(), from).await;
                         }
                     }
-                    Err(e) => println!("{e}"),
+                    Err(e) => debug!("{e}"),
                 }
             });
         }
     } else if proto == BindProtocol::Tcp {
         // Bind TCP Socket
         let tcp_sock = TcpListener::bind(bind).await.unwrap();
-        println!("Bound TCP socket {}", tcp_sock.local_addr().unwrap());
+        info!("Bound TCP socket {}", tcp_sock.local_addr().unwrap());
 
         // Main loop
         loop {
@@ -635,7 +636,7 @@ async fn dns_socket_task(
                             }
                             writer.flush().await.unwrap();
                         }
-                        Err(e) => println!("{e}"),
+                        Err(e) => debug!("{e}"),
                     }
                 }
             });
@@ -654,7 +655,7 @@ async fn fill_cache(
         // Do ever 10 minutes (first time will happen immediately)
         interval.tick().await;
 
-        println!("Refilling cache");
+        info!("Refilling cache");
 
         // Fill the cache
         let mut new_cache = HashMap::<ServiceFlags, CachedAddrs>::new();
@@ -705,7 +706,7 @@ async fn fill_cache(
         // Shuffle cached nodes and truncate to 100 nodes each
         let mut rng = thread_rng();
         for (service_bits, addrs) in new_cache.iter_mut() {
-            println!("Cache for service bits {}", service_bits);
+            debug!("Cache for service bits {}", service_bits);
             addrs.ipv4.shuffle(&mut rng);
             let mut final_ipv4 = Vec::<Ipv4Addr>::new();
             let mut ipv4_groups = HashSet::<Ipv4Addr>::new();
@@ -722,7 +723,7 @@ async fn fill_cache(
                     }
                     let asn = interpret(asmap_data, ip_bits);
                     if ipv4_asns.insert(asn) {
-                        println!("Adding {}, ASN {} to cache", addr, asn);
+                        debug!("Adding {}, ASN {} to cache", addr, asn);
                         final_ipv4.push(*addr);
                         if final_ipv4.len() >= 100 {
                             break;
@@ -732,7 +733,7 @@ async fn fill_cache(
                     // Get the /16 group
                     let group = addr & IPV4_NET_GROUP_MASK;
                     if !ipv4_groups.contains(&group) {
-                        println!("Adding {}, Group {} to cache", addr, group);
+                        debug!("Adding {}, Group {} to cache", addr, group);
                         ipv4_groups.insert(group);
                         final_ipv4.push(*addr);
                         if final_ipv4.len() >= 100 {
@@ -756,7 +757,7 @@ async fn fill_cache(
                     }
                     let asn = interpret(asmap_data, ip_bits);
                     if ipv6_asns.insert(asn) {
-                        println!("Adding {}, ASN {} to cache", addr, asn);
+                        debug!("Adding {}, ASN {} to cache", addr, asn);
                         final_ipv6.push(*addr);
                         if final_ipv6.len() >= 100 {
                             break;
@@ -775,7 +776,7 @@ async fn fill_cache(
                         addr & IPV6_NET_GROUP_MASK
                     };
                     if !ipv6_groups.contains(&group) {
-                        println!("Adding {}, Group {} to cache", addr, group);
+                        debug!("Adding {}, Group {} to cache", addr, group);
                         ipv6_groups.insert(group);
                         final_ipv6.push(*addr);
                         if final_ipv6.len() >= 100 {
@@ -793,7 +794,7 @@ async fn fill_cache(
                 cache_write.insert(filter, new_addrs);
             }
         }
-        println!("Cache Ready");
+        info!("Cache ready");
     }
 }
 

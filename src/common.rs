@@ -4,6 +4,7 @@ use std::{
 };
 
 use bitcoin::{network::Network, p2p::ServiceFlags};
+use log::debug;
 
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -118,7 +119,7 @@ pub fn parse_address(addr: &str) -> Result<NodeAddress, &'static str> {
                 || ip4.is_documentation()
                 || ip4.is_broadcast()
             {
-                println!("{} is not globally accessible", ip4);
+                debug!("{} is not globally accessible", ip4);
                 return Err("IPv4 addresses must be globally accessible");
             }
             return Ok(NodeAddress {
@@ -160,7 +161,7 @@ pub fn parse_address(addr: &str) -> Result<NodeAddress, &'static str> {
                         port: parsed_addr.port(),
                     });
                 }
-                println!("{} is not globally accessible or CJDNS", ip6);
+                debug!("{} is not globally accessible or CJDNS", ip6);
                 return Err("IPv6 addresses must be globally accessible or CJDNS");
             }
             return Ok(NodeAddress {

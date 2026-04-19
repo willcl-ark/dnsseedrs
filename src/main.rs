@@ -87,6 +87,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
 
     // Pick the network
@@ -97,7 +98,7 @@ async fn main() {
         | Ok(Network::Testnet4)
         | Ok(Network::Signet) => (),
         _ => {
-            println!("Unsupported network type: {}", args.chain);
+            eprintln!("Unsupported network type: {}", args.chain);
             std::process::exit(1);
         }
     }
@@ -106,7 +107,7 @@ async fn main() {
     // Check that DNSSEC keys directory is a directory
     if let Some(dnssec_keys) = &args.dnssec_keys {
         if !Path::new(dnssec_keys).is_dir() {
-            println!("{} is not a directory", dnssec_keys);
+            eprintln!("{} is not a directory", dnssec_keys);
             std::process::exit(1);
         }
     }
@@ -115,7 +116,7 @@ async fn main() {
     let asmap: Option<Vec<bool>>;
     if let Some(asmap_path) = &args.asmap {
         if !Path::new(asmap_path).is_file() {
-            println!("{} is not a file", asmap_path);
+            eprintln!("{} is not a file", asmap_path);
             std::process::exit(1);
         }
         asmap = Some(decode_asmap(&args.asmap.unwrap()));
@@ -132,13 +133,13 @@ async fn main() {
         } else if bind.starts_with("tcp://") {
             proto = BindProtocol::Tcp
         } else {
-            println!("{bind} is not a valid bind");
+            eprintln!("{bind} is not a valid bind");
             std::process::exit(1);
         }
         let bind_addr = match SocketAddr::from_str(&bind[6..]) {
             Ok(a) => a,
             Err(_) => {
-                println!("{bind} is not a valid bind");
+                eprintln!("{bind} is not a valid bind");
                 std::process::exit(1);
             }
         };
