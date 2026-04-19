@@ -80,6 +80,27 @@ fn sample_cached_addrs<T: Copy>(addrs: &[T], limit: usize, rng: &mut impl Rng) -
         .collect()
 }
 
+fn write_bits_from_octets(bits: &mut [bool], octets: &[u8]) {
+    for (byte_index, byte) in octets.iter().enumerate() {
+        for bit in 0..u8::BITS as usize {
+            bits[(byte_index * 8) + bit] = ((byte >> (7 - bit)) & 1) == 1;
+        }
+    }
+}
+
+fn ipv4_mapped_asmap_bits(addr: Ipv4Addr) -> [bool; 128] {
+    let mut bits = [false; 128];
+    bits[80..96].fill(true);
+    write_bits_from_octets(&mut bits[96..], &addr.octets());
+    bits
+}
+
+fn ipv6_asmap_bits(addr: Ipv6Addr) -> [bool; 128] {
+    let mut bits = [false; 128];
+    write_bits_from_octets(&mut bits, &addr.octets());
+    bits
+}
+
 struct SeederInfo {
     // Static, setup on init and never changes
     seed_domain: Name<Vec<u8>>,
@@ -745,20 +766,13 @@ async fn fill_cache(
         for (service_bits, addrs) in new_cache.iter_mut() {
             debug!("Cache for service bits {}", service_bits);
             addrs.ipv4.shuffle(&mut rng);
-            let mut final_ipv4 = Vec::<Ipv4Addr>::new();
-            let mut ipv4_groups = HashSet::<Ipv4Addr>::new();
-            let mut ipv4_asns = HashSet::<u32>::new();
+            let mut final_ipv4 = Vec::<Ipv4Addr>::with_capacity(100);
+            let mut ipv4_groups = HashSet::<Ipv4Addr>::with_capacity(100);
+            let mut ipv4_asns = HashSet::<u32>::with_capacity(100);
             for addr in &addrs.ipv4 {
                 if let Some(asmap_data) = &asmap {
-                    let mut ip_bits = Vec::<bool>::new();
-                    // IPv4 in IPv6 Prefix
-                    ip_bits.resize(80, false);
-                    ip_bits.resize(96, true);
-                    let ip_int = addr.to_bits().reverse_bits();
-                    for bit in 0..u32::BITS {
-                        ip_bits.push(((ip_int >> bit) & 1) == 1)
-                    }
-                    let asn = interpret(asmap_data, ip_bits);
+                    let ip_bits = ipv4_mapped_asmap_bits(*addr);
+                    let asn = interpret(asmap_data, &ip_bits);
                     if ipv4_asns.insert(asn) {
                         debug!("Adding {}, ASN {} to cache", addr, asn);
                         final_ipv4.push(*addr);
@@ -782,17 +796,13 @@ async fn fill_cache(
             addrs.ipv4 = final_ipv4;
 
             addrs.ipv6.shuffle(&mut rng);
-            let mut final_ipv6 = Vec::<Ipv6Addr>::new();
-            let mut ipv6_groups = HashSet::<Ipv6Addr>::new();
-            let mut ipv6_asns = HashSet::<u32>::new();
+            let mut final_ipv6 = Vec::<Ipv6Addr>::with_capacity(100);
+            let mut ipv6_groups = HashSet::<Ipv6Addr>::with_capacity(100);
+            let mut ipv6_asns = HashSet::<u32>::with_capacity(100);
             for addr in &addrs.ipv6 {
                 if let Some(asmap_data) = &asmap {
-                    let mut ip_bits = Vec::<bool>::new();
-                    let ip_int = addr.to_bits().reverse_bits();
-                    for bit in 0..u128::BITS {
-                        ip_bits.push(((ip_int >> bit) & 1) == 1)
-                    }
-                    let asn = interpret(asmap_data, ip_bits);
+                    let ip_bits = ipv6_asmap_bits(*addr);
+                    let asn = interpret(asmap_data, &ip_bits);
                     if ipv6_asns.insert(asn) {
                         debug!("Adding {}, ASN {} to cache", addr, asn);
                         final_ipv6.push(*addr);
@@ -882,9 +892,12 @@ pub async fn dns_thread(
 
 #[cfg(test)]
 mod tests {
-    use super::sample_cached_addrs;
+    use super::{ipv4_mapped_asmap_bits, ipv6_asmap_bits, sample_cached_addrs};
     use rand::{rngs::StdRng, SeedableRng};
-    use std::collections::HashSet;
+    use std::{
+        collections::HashSet,
+        net::{Ipv4Addr, Ipv6Addr},
+    };
 
     #[test]
     fn sample_cached_addrs_returns_all_items_when_under_limit() {
@@ -902,5 +915,28 @@ mod tests {
         let unique = sampled.iter().copied().collect::<HashSet<_>>();
         assert_eq!(unique.len(), 20);
         assert!(sampled.iter().all(|v| *v < 100));
+    }
+
+    #[test]
+    fn ipv4_mapped_asmap_bits_use_ipv4_mapped_prefix() {
+        let bits = ipv4_mapped_asmap_bits(Ipv4Addr::new(1, 2, 3, 4));
+        assert!(bits[..80].iter().all(|bit| !*bit));
+        assert!(bits[80..96].iter().all(|bit| *bit));
+        assert_eq!(
+            &bits[96..128],
+            &[
+                false, false, false, false, false, false, false, true, false, false, false, false,
+                false, false, true, false, false, false, false, false, false, false, true, true,
+                false, false, false, false, false, true, false, false,
+            ]
+        );
+    }
+
+    #[test]
+    fn ipv6_asmap_bits_follow_network_bit_order() {
+        let bits = ipv6_asmap_bits(Ipv6Addr::new(0x8000, 0, 0, 0, 0, 0, 0, 1));
+        assert!(bits[0]);
+        assert!(bits[1..127].iter().all(|bit| !*bit));
+        assert!(bits[127]);
     }
 }

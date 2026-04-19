@@ -88,7 +88,7 @@ fn decode_jump<'a>(bitpos: &mut Peekable<Enumerate<impl Iterator<Item = &'a bool
     decode_bits(bitpos, 17, Vec::from(JUMP_BIT_SIZES))
 }
 
-pub fn interpret(asmap: &[bool], ip: Vec<bool>) -> u32 {
+pub fn interpret(asmap: &[bool], ip: &[bool]) -> u32 {
     let mut pos = asmap.iter().enumerate().peekable();
     let mut bits = ip.len();
     let mut asn = 0;
