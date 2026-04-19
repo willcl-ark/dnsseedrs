@@ -101,6 +101,11 @@ struct CrawlInfo {
     age: u64,
 }
 
+struct ReservedNode {
+    row_address: String,
+    node: NodeInfo,
+}
+
 enum CrawledNode {
     Failed(CrawlInfo),
     UpdatedInfo(CrawlInfo),
@@ -154,8 +159,7 @@ async fn socks5_connect(
     sock.write_all(&[0x05, 0x01, 0x00, 0x03]).await?;
     // The destination we want the server to connect to
     sock.write_all(&[u8::try_from(destination.len()).unwrap()])
-        .await
-        ?;
+        .await?;
     sock.write_all(destination.as_bytes()).await?;
     sock.write_all(&port.to_be_bytes()).await?;
     sock.flush().await?;
@@ -848,6 +852,30 @@ fn reserve_slot(slots: &mut CrawlSlots, node: &NodeInfo) {
     }
 }
 
+fn node_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Option<ReservedNode>> {
+    let address: String = r.get(0)?;
+    Ok(NodeInfo::construct(
+        address.clone(),
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        u64::from_be_bytes(r.get(4)?),
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
+        r.get(8)?,
+        r.get(9)?,
+        r.get(10)?,
+        r.get(11)?,
+        r.get(12)?,
+    )
+    .ok()
+    .map(|node| ReservedNode {
+        row_address: address,
+        node,
+    }))
+}
+
 fn reserve_nodes_for_crawl(
     conn: &mut Connection,
     due_before: u64,
@@ -859,40 +887,48 @@ fn reserve_nodes_for_crawl(
     }
 
     let tx = conn.transaction()?;
-    let mut offset = 0_i64;
+    let mut cursor: Option<(u64, String)> = None;
     let mut nodes = Vec::new();
+    let mut reserved_addresses = Vec::new();
     while slots.global > 0 {
+        // Continue each batch from the last scanned `(last_tried, address)` tuple so
+        // SQLite can walk the reservation index sequentially instead of skipping
+        // an ever-growing OFFSET worth of due rows.
         let batch = {
-            let mut select_next_nodes = tx.prepare(
-                "SELECT * FROM nodes WHERE last_tried < ? ORDER BY last_tried LIMIT ? OFFSET ?",
-            )?;
-            let node_iter = select_next_nodes.query_map(
-                params![
-                    due_before,
-                    i64::try_from(RESERVATION_SCAN_BATCH).unwrap(),
-                    offset
-                ],
-                |r| {
-                    Ok(NodeInfo::construct(
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        u64::from_be_bytes(r.get(4)?),
-                        r.get(5)?,
-                        r.get(6)?,
-                        r.get(7)?,
-                        r.get(8)?,
-                        r.get(9)?,
-                        r.get(10)?,
-                        r.get(11)?,
-                        r.get(12)?,
-                    ))
-                },
-            )?;
+            let mut select_next_nodes = match &cursor {
+                Some(..) => tx.prepare(
+                    "SELECT * FROM nodes
+                     WHERE last_tried < ?
+                       AND (last_tried > ? OR (last_tried = ? AND address > ?))
+                     ORDER BY last_tried, address
+                     LIMIT ?",
+                )?,
+                None => tx.prepare(
+                    "SELECT * FROM nodes
+                     WHERE last_tried < ?
+                     ORDER BY last_tried, address
+                     LIMIT ?",
+                )?,
+            };
+            let node_iter = match &cursor {
+                Some((last_tried, address)) => select_next_nodes.query_map(
+                    params![
+                        due_before,
+                        last_tried,
+                        last_tried,
+                        address,
+                        i64::try_from(RESERVATION_SCAN_BATCH).unwrap()
+                    ],
+                    node_from_row,
+                )?,
+                None => select_next_nodes.query_map(
+                    params![due_before, i64::try_from(RESERVATION_SCAN_BATCH).unwrap()],
+                    node_from_row,
+                )?,
+            };
             node_iter
                 .filter_map(|n| match n {
-                    Ok(ni) => ni.ok(),
+                    Ok(ni) => ni,
                     Err(..) => None,
                 })
                 .collect::<Vec<_>>()
@@ -901,13 +937,20 @@ fn reserve_nodes_for_crawl(
             break;
         }
 
-        offset += i64::try_from(batch.len()).unwrap();
-        for node in batch {
-            if !can_reserve_node(&slots, &node) {
+        if let Some(last_scanned) = batch.last() {
+            cursor = Some((
+                last_scanned.node.last_tried,
+                last_scanned.row_address.clone(),
+            ));
+        }
+
+        for reserved_node in batch {
+            if !can_reserve_node(&slots, &reserved_node.node) {
                 continue;
             }
-            reserve_slot(&mut slots, &node);
-            nodes.push(node);
+            reserve_slot(&mut slots, &reserved_node.node);
+            reserved_addresses.push(reserved_node.row_address);
+            nodes.push(reserved_node.node);
             if slots.global == 0 {
                 break;
             }
@@ -915,8 +958,8 @@ fn reserve_nodes_for_crawl(
     }
 
     let mut reserve_stmt = tx.prepare("UPDATE nodes SET last_tried = ? WHERE address = ?")?;
-    for node in &nodes {
-        reserve_stmt.execute(params![reservation_time, node.addr.to_string()])?;
+    for address in &reserved_addresses {
+        reserve_stmt.execute(params![reservation_time, address])?;
     }
     drop(reserve_stmt);
     tx.commit()?;
@@ -1277,7 +1320,10 @@ pub async fn crawler_thread(
 
 #[cfg(test)]
 mod tests {
-    use super::{next_crawl_delay, proxy_concurrency_caps, reserve_nodes_for_crawl, CrawlSlots};
+    use super::{
+        next_crawl_delay, proxy_concurrency_caps, reserve_nodes_for_crawl, CrawlSlots,
+        RESERVATION_SCAN_BATCH,
+    };
     use rusqlite::{params, Connection};
     use std::time::Duration;
 
@@ -1299,6 +1345,11 @@ mod tests {
                 reliability_1w REAL NOT NULL,
                 reliability_1m REAL NOT NULL
             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE INDEX idx_nodes_last_tried_address ON nodes(last_tried, address)",
             [],
         )
         .unwrap();
@@ -1400,6 +1451,61 @@ mod tests {
                 "1.1.1.1:8333".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn reserve_nodes_for_crawl_scans_past_skipped_batches() {
+        let mut conn = setup_conn();
+        for i in 0..=RESERVATION_SCAN_BATCH {
+            let suffix = [
+                char::from(b'a' + u8::try_from(i / 26).unwrap()),
+                char::from(b'a' + u8::try_from(i % 26).unwrap()),
+            ];
+            let host = format!(
+                "{}{}.onion",
+                "a".repeat(54),
+                suffix.iter().collect::<String>()
+            );
+            insert_node(&conn, &format!("{host}:8333"), 10);
+        }
+        insert_node(&conn, "1.1.1.1:8333", 11);
+
+        let reserved = reserve_nodes_for_crawl(
+            &mut conn,
+            20,
+            100,
+            CrawlSlots {
+                global: 1,
+                onion: 0,
+                i2p: 0,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(reserved.len(), 1);
+        assert_eq!(reserved[0].addr.to_string(), "1.1.1.1:8333");
+    }
+
+    #[test]
+    fn reserve_nodes_for_crawl_keeps_scanning_same_timestamp_batches() {
+        let mut conn = setup_conn();
+        for i in 0..600 {
+            insert_node(&conn, &format!("11.{}.{}.1:8333", i / 256, i % 256), 10);
+        }
+
+        let reserved = reserve_nodes_for_crawl(
+            &mut conn,
+            20,
+            100,
+            CrawlSlots {
+                global: 600,
+                onion: 0,
+                i2p: 0,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(reserved.len(), 600);
     }
 
     #[test]

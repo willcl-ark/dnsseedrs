@@ -45,10 +45,12 @@ pub fn initialize_database(conn: &Connection, seednodes: &[String]) {
     )
     .unwrap();
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_nodes_last_tried ON nodes(last_tried)",
+        "CREATE INDEX IF NOT EXISTS idx_nodes_last_tried_address ON nodes(last_tried, address)",
         [],
     )
     .unwrap();
+    conn.execute("DROP INDEX IF EXISTS idx_nodes_last_tried", [])
+        .unwrap();
 
     let mut new_node_stmt = conn
         .prepare(
@@ -94,6 +96,27 @@ mod tests {
     #[test]
     fn initialize_database_creates_index_and_drops_invalid_seeds() {
         let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE nodes (
+                address TEXT PRIMARY KEY,
+                last_tried INTEGER NOT NULL,
+                last_seen INTEGER NOT NULL,
+                user_agent TEXT NOT NULL,
+                services BLOB NOT NULL,
+                starting_height INTEGER NOT NULL,
+                protocol_version INTEGER NOT NULL,
+                try_count INTEGER NOT NULL,
+                reliability_2h REAL NOT NULL,
+                reliability_8h REAL NOT NULL,
+                reliability_1d REAL NOT NULL,
+                reliability_1w REAL NOT NULL,
+                reliability_1m REAL NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX idx_nodes_last_tried ON nodes(last_tried)", [])
+            .unwrap();
         initialize_database(
             &conn,
             &["not-an-address".to_string(), "1.1.1.1:8333".to_string()],
@@ -104,13 +127,14 @@ mod tests {
             .unwrap();
         assert_eq!(node_count, 1);
 
-        let has_last_tried_index = conn
+        let index_names = conn
             .prepare("PRAGMA index_list('nodes')")
             .unwrap()
             .query_map([], |row| row.get::<usize, String>(1))
             .unwrap()
             .filter_map(Result::ok)
-            .any(|name| name == "idx_nodes_last_tried");
-        assert!(has_last_tried_index);
+            .collect::<Vec<_>>();
+        assert!(index_names.contains(&"idx_nodes_last_tried_address".to_string()));
+        assert!(!index_names.contains(&"idx_nodes_last_tried".to_string()));
     }
 }
