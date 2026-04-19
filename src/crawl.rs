@@ -898,8 +898,8 @@ fn reserve_nodes_for_crawl(
             let mut select_next_nodes = match &cursor {
                 Some(..) => tx.prepare(
                     "SELECT * FROM nodes
-                     WHERE last_tried < ?
-                       AND (last_tried > ? OR (last_tried = ? AND address > ?))
+                     WHERE (last_tried, address) > (?, ?)
+                       AND last_tried < ?
                      ORDER BY last_tried, address
                      LIMIT ?",
                 )?,
@@ -913,10 +913,9 @@ fn reserve_nodes_for_crawl(
             let node_iter = match &cursor {
                 Some((last_tried, address)) => select_next_nodes.query_map(
                     params![
-                        due_before,
-                        last_tried,
                         last_tried,
                         address,
+                        due_before,
                         i64::try_from(RESERVATION_SCAN_BATCH).unwrap()
                     ],
                     node_from_row,
@@ -1506,6 +1505,34 @@ mod tests {
         .unwrap();
 
         assert_eq!(reserved.len(), 600);
+    }
+
+    #[test]
+    fn reserve_nodes_cursor_query_uses_composite_index() {
+        let conn = setup_conn();
+        let plan_rows = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT * FROM nodes
+                 WHERE (last_tried, address) > (?, ?)
+                   AND last_tried < ?
+                 ORDER BY last_tried, address
+                 LIMIT ?",
+            )
+            .unwrap()
+            .query_map(params![0_u64, "", 100_u64, 1_i64], |row| {
+                row.get::<usize, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(plan_rows
+            .iter()
+            .any(|detail| detail.contains("idx_nodes_last_tried_address")));
+        assert!(plan_rows
+            .iter()
+            .any(|detail| detail.contains("(last_tried,address)>(?,?)")));
     }
 
     #[test]
