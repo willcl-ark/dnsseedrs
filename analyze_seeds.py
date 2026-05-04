@@ -103,7 +103,7 @@ def parse_seeds(path: str) -> list[dict]:
 
 
 def extract_host(addr: str) -> str | None:
-    if ".onion:" in addr:
+    if ".onion:" in addr or ".b32.i2p:" in addr:
         return None
     if addr.startswith("["):
         return addr.split("]")[0][1:]
@@ -128,6 +128,8 @@ def extract_prefix(addr: str) -> str | None:
 def classify_network(addr: str) -> str:
     if ".onion:" in addr:
         return "tor"
+    if ".b32.i2p:" in addr:
+        return "i2p"
     if addr.startswith("["):
         return "ipv6"
     return "ipv4"
@@ -318,8 +320,8 @@ def build_data(rows: list[dict], asmap: dict, asn_names: dict[str, str]) -> dict
     kb_counts = [c for _, c in top_kb]
 
     # Network stats
-    networks = ["ipv4", "ipv6", "tor"]
-    net_labels = ["IPv4", "IPv6", "Tor"]
+    networks = ["ipv4", "ipv6", "tor", "i2p"]
+    net_labels = ["IPv4", "IPv6", "Tor", "I2P"]
     known_by_net = Counter()
     good_by_net = Counter()
     cross_good = {n: Counter() for n in networks}
@@ -589,7 +591,7 @@ def build_data(rows: list[dict], asmap: dict, asn_names: dict[str, str]) -> dict
         },
         "networks": {
             "labels": net_labels,
-            "keys": ["ipv4", "ipv6", "tor"],
+            "keys": networks,
             "known": net_known_vals,
             "good": net_good_vals,
             "good_rates": net_good_rates,

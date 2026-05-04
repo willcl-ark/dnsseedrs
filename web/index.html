@@ -102,7 +102,7 @@ tailwind.config = {
       <p class="text-od-lgrey mb-2">
         Likely sybil nodes detected by grouping good IPv4 (/24) and IPv6 (/48) nodes by prefix and flagging any
         prefix where node count exceeds <strong class="text-od-fg">mean + 5&sigma;</strong>
-        (<span id="sybil-stats"></span>). Tor nodes are excluded as they have no routable prefix.
+        (<span id="sybil-stats"></span>). Tor and I2P nodes are excluded as they have no routable prefix.
       </p>
       <p class="text-od-lgrey mb-4">
         Flagged <strong class="text-od-fg" id="sybil-prefix-count"></strong> prefixes containing
@@ -117,7 +117,7 @@ tailwind.config = {
       <p class="text-od-lgrey mb-2">
         Good routable nodes grouped by autonomous system, flagging any
         ASN where node count exceeds <strong class="text-od-fg">mean + 5&sigma;</strong>
-        (<span id="asn-concentration-stats"></span>). Tor nodes are excluded as they have no routable IP.
+        (<span id="asn-concentration-stats"></span>). Tor and I2P nodes are excluded as they have no routable IP.
       </p>
       <p class="text-od-lgrey mb-4">
         Flagged <strong class="text-od-fg" id="asn-concentration-count"></strong> ASNs containing
@@ -129,19 +129,19 @@ tailwind.config = {
 
     <section id="net-class-sybil" class="bg-od-bg1 rounded-lg p-6">
       <h2 class="text-lg font-semibold mb-4"><a href="#net-class-sybil" class="text-od-fg hover:text-od-blue">Good Nodes: Network &times; Classification (Sybil Filtered)</a></h2>
-      <p class="text-od-grey text-sm mb-3">Probable sybil nodes separated out. Tor nodes shown as-is (no prefix-based sybil detection).</p>
+      <p class="text-od-grey text-sm mb-3">Probable sybil nodes separated out. Tor and I2P nodes shown as-is (no prefix-based sybil detection).</p>
       <canvas id="chart-net-class-sybil"></canvas>
     </section>
 
     <section id="top-prefixes" class="bg-od-bg1 rounded-lg p-6">
       <h2 class="text-lg font-semibold mb-4"><a href="#top-prefixes" class="text-od-fg hover:text-od-blue">Top 20 Prefixes by Good Node Count</a></h2>
-      <p class="text-od-grey text-sm mb-3">IPv4 /24 and IPv6 /48 prefixes. Excludes Tor.</p>
+      <p class="text-od-grey text-sm mb-3">IPv4 /24 and IPv6 /48 prefixes. Excludes Tor and I2P.</p>
       <div style="height: 550px"><canvas id="chart-top-prefixes"></canvas></div>
     </section>
 
     <section id="top-asns" class="bg-od-bg1 rounded-lg p-6">
       <h2 class="text-lg font-semibold mb-4"><a href="#top-asns" class="text-od-fg hover:text-od-blue">Top 20 ASNs by Good Node Count</a></h2>
-      <p class="text-od-grey text-sm mb-3">Routable good IPv4 and IPv6 nodes mapped through <a href="https://github.com/bitcoin-core/asmap-data" class="text-od-cyan hover:underline"><code>latest_asmap.decoded</code></a>. Excludes Tor.</p>
+      <p class="text-od-grey text-sm mb-3">Routable good IPv4 and IPv6 nodes mapped through <a href="https://github.com/bitcoin-core/asmap-data" class="text-od-cyan hover:underline"><code>latest_asmap.decoded</code></a>. Excludes Tor and I2P.</p>
       <div style="height: 550px"><canvas id="chart-top-asns"></canvas></div>
     </section>
 
@@ -221,6 +221,7 @@ const C = {
   ipv4:         '#48b0bd',
   ipv6:         '#e2b86b',
   tor:          '#bf68d9',
+  i2p:          '#cc9057',
   // sybil variants — visually distinct from parent
   core_sybil:   '#266269',
   knots_sybil:  '#835d1a',
