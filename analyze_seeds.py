@@ -138,8 +138,6 @@ def classify_agent(ua: str) -> str:
     if not ua:
         return "unknown"
     ua_lower = ua.lower()
-    if "bip110" in ua_lower:
-        return "bip110"
     if "knots" in ua_lower:
         return "knots"
     cleaned = re.sub(r"\([^)]*\)", "", ua).strip("/")
@@ -155,10 +153,7 @@ def extract_version(ua: str) -> str:
     clean = [p.split("(")[0].strip() for p in parts if p]
     if not clean:
         return ua or "unknown"
-    bip110 = [p for p in clean if "bip110" in p.lower()]
-    knots = [p for p in clean if "Knots" in p and "bip110" not in p.lower()]
-    if bip110:
-        return "/".join(knots + bip110)
+    knots = [p for p in clean if "Knots" in p]
     if knots:
         return knots[0]
     return clean[0]
@@ -273,8 +268,8 @@ def concentration_stats(
 
 
 def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> dict:
-    classes = ["core", "knots", "bip110", "other"]
-    labels = ["Core", "Knots (no BIP110)", "BIP110", "Other"]
+    classes = ["core", "knots", "other"]
+    labels = ["Bitcoin Core", "Knots", "Other"]
 
     def asn_info(asn: str | None) -> dict:
         if asn is None:
@@ -344,16 +339,16 @@ def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> 
     top_agent_labels = [a for a, _ in top_agents]
     top_agent_counts = [c for _, c in top_agents]
 
-    # Knots & BIP110 versions
-    knots_bip_agents = Counter()
+    # Knots versions
+    knots_agents = Counter()
     for r in good_rows:
         cls = classify_agent(r["user_agent"])
-        if cls in ("knots", "bip110"):
-            knots_bip_agents[extract_version(r["user_agent"])] += 1
+        if cls == "knots":
+            knots_agents[extract_version(r["user_agent"])] += 1
 
-    top_kb = knots_bip_agents.most_common(15)
-    kb_labels = [a for a, _ in top_kb]
-    kb_counts = [c for _, c in top_kb]
+    top_knots = knots_agents.most_common(15)
+    knots_labels = [a for a, _ in top_knots]
+    knots_counts = [c for _, c in top_knots]
 
     # Network stats
     networks = ["ipv4", "ipv6", "tor", "i2p"]
@@ -489,7 +484,6 @@ def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> 
                 "total": prefix_totals[p],
                 "core": prefix_by_class[p].get("core", 0),
                 "knots": prefix_by_class[p].get("knots", 0),
-                "bip110": prefix_by_class[p].get("bip110", 0),
                 "other": prefix_by_class[p].get("other", 0),
             }
         )
@@ -591,7 +585,6 @@ def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> 
                 "total": asn_totals[asn],
                 "core": asn_by_class[asn].get("core", 0),
                 "knots": asn_by_class[asn].get("knots", 0),
-                "bip110": asn_by_class[asn].get("bip110", 0),
                 "other": asn_by_class[asn].get("other", 0),
             }
         )
@@ -656,9 +649,9 @@ def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> 
             "labels": top_agent_labels,
             "counts": top_agent_counts,
         },
-        "knots_bip110_versions": {
-            "labels": kb_labels,
-            "counts": kb_counts,
+        "knots_versions": {
+            "labels": knots_labels,
+            "counts": knots_counts,
         },
         "networks": {
             "labels": net_labels,

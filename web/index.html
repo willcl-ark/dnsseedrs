@@ -74,7 +74,7 @@ tailwind.config = {
     </section>
 
     <section id="kb-versions" class="bg-od-bg1 rounded-lg p-6">
-      <h2 class="text-lg font-semibold mb-4"><a href="#kb-versions" class="text-od-fg hover:text-od-blue">Knots &amp; BIP110 Version Distribution (Good)</a></h2>
+      <h2 class="text-lg font-semibold mb-4"><a href="#kb-versions" class="text-od-fg hover:text-od-blue">Knots Version Distribution (Good)</a></h2>
       <p class="text-od-grey text-sm mb-3">No sybil delineation applied.</p>
       <div style="height: 450px"><canvas id="chart-kb-versions"></canvas></div>
     </section>
@@ -162,7 +162,6 @@ tailwind.config = {
             <th class="text-right py-2 px-3">Total</th>
             <th class="text-right py-2 px-3">Core</th>
             <th class="text-right py-2 px-3">Knots</th>
-            <th class="text-right py-2 px-3">BIP110</th>
             <th class="text-right py-2 px-3">Other</th>
           </tr></thead>
           <tbody id="prefix-table-body"></tbody>
@@ -180,7 +179,6 @@ tailwind.config = {
             <th class="text-right py-2 px-3">Total</th>
             <th class="text-right py-2 px-3">Core</th>
             <th class="text-right py-2 px-3">Knots</th>
-            <th class="text-right py-2 px-3">BIP110</th>
             <th class="text-right py-2 px-3">Other</th>
           </tr></thead>
           <tbody id="asn-table-body"></tbody>
@@ -217,9 +215,8 @@ Chart.defaults.font.family = 'ui-monospace, monospace';
 const GRID = '#30363f';
 
 const C = {
-  core:         '#4fa6ed',
-  knots:        '#cc9057',
-  bip110:       '#e55561',
+  core:         '#cc9057',
+  knots:        '#4fa6ed',
   other:        '#535965',
   unknown:      '#323641',
   known:        '#e2b86b',
@@ -231,7 +228,6 @@ const C = {
   // sybil variants — visually distinct from parent
   core_sybil:   '#266269',
   knots_sybil:  '#835d1a',
-  bip110_sybil: '#8b3434',
   other_sybil:  '#323641',
   business:     '#8ebd6b',
   education_research: '#4fa6ed',
@@ -245,9 +241,9 @@ function colKeys(keys) { return keys.map(col); }
 
 function colorForUa(label) {
   const ll = label.toLowerCase();
-  if (ll.includes('bip110')) return C.bip110;
   if (ll.includes('knots')) return C.knots;
-  return C.core;
+  if (label.startsWith('Satoshi:') && !label.includes('/')) return C.core;
+  return C.other;
 }
 
 function barChart(id, labels, datasets, opts = {}) {
@@ -344,8 +340,8 @@ async function main() {
     data: c.good_rates, backgroundColor: classColors,
   }], { maxY: 100 });
 
-  // Knots/BIP110 versions
-  const kb = D.knots_bip110_versions;
+  // Knots versions
+  const kb = D.knots_versions;
   barChart('chart-kb-versions', kb.labels, [{
     data: kb.counts,
     backgroundColor: kb.labels.map(colorForUa),
@@ -447,8 +443,7 @@ async function main() {
     `${fmt(pt.stats.distinct_prefixes)} distinct prefixes across ${fmt(pt.stats.total_good_routable)} good routable nodes<br>` +
     `${pt.stats.sybil_prefix_count} probable sybil prefixes hold:<br>` +
     `&nbsp;&nbsp;${sc.core.pct}% of Core nodes (${fmt(sc.core.sybil)}/${fmt(sc.core.total)})<br>` +
-    `&nbsp;&nbsp;${sc.knots.pct}% of Knots nodes (${fmt(sc.knots.sybil)}/${fmt(sc.knots.total)})<br>` +
-    `&nbsp;&nbsp;${sc.bip110.pct}% of BIP110 nodes (${fmt(sc.bip110.sybil)}/${fmt(sc.bip110.total)})`;
+    `&nbsp;&nbsp;${sc.knots.pct}% of Knots nodes (${fmt(sc.knots.sybil)}/${fmt(sc.knots.total)})`;
   document.getElementById('prefix-table-body').innerHTML = pt.rows.map(r =>
     `<tr class="border-b border-od-bg2">
       <td class="py-2 px-3 font-mono">${escapeHtml(r.prefix)}</td>
@@ -456,7 +451,6 @@ async function main() {
       <td class="text-right py-2 px-3">${fmt(r.total)}</td>
       <td class="text-right py-2 px-3">${fmt(r.core)}</td>
       <td class="text-right py-2 px-3">${fmt(r.knots)}</td>
-      <td class="text-right py-2 px-3">${fmt(r.bip110)}</td>
       <td class="text-right py-2 px-3">${fmt(r.other)}</td>
     </tr>`
   ).join('');
@@ -468,15 +462,13 @@ async function main() {
     `${fmt(at.stats.mapped_asns)} distinct ASNs across ${fmt(at.stats.total_good_routable_mapped)} mapped good routable nodes<br>` +
     `${at.stats.sybil_asn_count} high-concentration ASNs hold:<br>` +
     `&nbsp;&nbsp;${asc.core.pct}% of Core nodes (${fmt(asc.core.sybil)}/${fmt(asc.core.total)})<br>` +
-    `&nbsp;&nbsp;${asc.knots.pct}% of Knots nodes (${fmt(asc.knots.sybil)}/${fmt(asc.knots.total)})<br>` +
-    `&nbsp;&nbsp;${asc.bip110.pct}% of BIP110 nodes (${fmt(asc.bip110.sybil)}/${fmt(asc.bip110.total)})`;
+    `&nbsp;&nbsp;${asc.knots.pct}% of Knots nodes (${fmt(asc.knots.sybil)}/${fmt(asc.knots.total)})`;
   document.getElementById('asn-table-body').innerHTML = at.rows.map(r =>
     `<tr class="border-b border-od-bg2">
       <td class="py-2 px-3 font-mono" title="${escapeHtml(r.tooltip)}">${escapeHtml(r.asn)}</td>
       <td class="text-right py-2 px-3">${fmt(r.total)}</td>
       <td class="text-right py-2 px-3">${fmt(r.core)}</td>
       <td class="text-right py-2 px-3">${fmt(r.knots)}</td>
-      <td class="text-right py-2 px-3">${fmt(r.bip110)}</td>
       <td class="text-right py-2 px-3">${fmt(r.other)}</td>
     </tr>`
   ).join('');
