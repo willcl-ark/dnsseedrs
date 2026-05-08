@@ -145,6 +145,12 @@ tailwind.config = {
       <div style="height: 550px"><canvas id="chart-top-asns"></canvas></div>
     </section>
 
+    <section id="asn-categories" class="bg-od-bg1 rounded-lg p-6">
+      <h2 class="text-lg font-semibold mb-4"><a href="#asn-categories" class="text-od-fg hover:text-od-blue">ASN Categories (Good Nodes)</a></h2>
+      <p class="text-od-grey text-sm mb-3">Routable good IPv4 and IPv6 nodes grouped by the mapped ASN metadata category. Excludes Tor and I2P.</p>
+      <div class="max-w-md mx-auto"><canvas id="chart-asn-categories"></canvas></div>
+    </section>
+
     <section id="prefix-table" class="bg-od-bg1 rounded-lg p-6">
       <h2 class="text-lg font-semibold mb-4"><a href="#prefix-table" class="text-od-fg hover:text-od-blue">IP Prefix Concentration (Good Nodes)</a></h2>
       <p class="text-od-grey text-sm mb-3" id="prefix-stats"></p>
@@ -227,6 +233,11 @@ const C = {
   knots_sybil:  '#835d1a',
   bip110_sybil: '#8b3434',
   other_sybil:  '#323641',
+  business:     '#8ebd6b',
+  education_research: '#4fa6ed',
+  government_admin:   '#e2b86b',
+  hosting:      '#e55561',
+  isp:          '#48b0bd',
 };
 
 function col(key) { return C[key] || '#535965'; }
@@ -266,7 +277,21 @@ function pieChart(id, labels, values, colors) {
       labels,
       datasets: [{ data: values, backgroundColor: colors, borderWidth: 0 }],
     },
-    options: { responsive: true, plugins: { legend: { position: 'bottom' } } },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: { position: 'bottom' },
+        tooltip: {
+          callbacks: {
+            label(ctx) {
+              const total = ctx.dataset.data.reduce((sum, value) => sum + value, 0);
+              const pct = total ? (ctx.parsed / total * 100).toFixed(1) : '0.0';
+              return `${ctx.label}: ${fmt(ctx.parsed)} (${pct}%)`;
+            },
+          },
+        },
+      },
+    },
   });
 }
 
@@ -364,7 +389,7 @@ async function main() {
   document.getElementById('asn-concentration-count').textContent = asy.asns.length;
   document.getElementById('asn-concentration-node-count').textContent = fmt(asy.count);
   document.getElementById('asn-concentration-list').innerHTML = asy.items.map(item =>
-    `<span title="${escapeHtml(item.name)}">${escapeHtml(item.asn)}</span>`
+    `<span title="${escapeHtml(item.tooltip)}">${escapeHtml(item.asn)}</span>`
   ).join(', ');
 
   barChart('chart-asn-concentration', asy.bars.map(b => b.label), [{
@@ -390,7 +415,7 @@ async function main() {
         afterTitle(items) {
           const idx = items[0].dataIndex;
           const owner = tp.owners[idx];
-          return owner && owner.asn ? `${owner.asn} - ${owner.name}` : 'ASN unknown';
+          return owner && owner.asn ? owner.tooltip.split('\n') : 'ASN unknown';
         },
       },
     });
@@ -406,10 +431,14 @@ async function main() {
       tooltipCallbacks: {
         afterTitle(items) {
           const idx = items[0].dataIndex;
-          return ta.names[idx];
+          return ta.tooltips[idx].split('\n');
         },
       },
     });
+
+  // ASN categories
+  const ac = D.asn_categories;
+  pieChart('chart-asn-categories', ac.labels, ac.values, colKeys(ac.keys));
 
   // Prefix table
   const pt = D.prefix_table;
@@ -423,7 +452,7 @@ async function main() {
   document.getElementById('prefix-table-body').innerHTML = pt.rows.map(r =>
     `<tr class="border-b border-od-bg2">
       <td class="py-2 px-3 font-mono">${escapeHtml(r.prefix)}</td>
-      <td class="py-2 px-3" title="${escapeHtml(r.asn ? `${r.asn} - ${r.asn_name}` : 'ASN unknown')}">${escapeHtml(r.asn_name || 'Unknown')}</td>
+      <td class="py-2 px-3" title="${escapeHtml(r.asn_tooltip)}">${escapeHtml(r.asn_name || 'Unknown')}</td>
       <td class="text-right py-2 px-3">${fmt(r.total)}</td>
       <td class="text-right py-2 px-3">${fmt(r.core)}</td>
       <td class="text-right py-2 px-3">${fmt(r.knots)}</td>
@@ -443,7 +472,7 @@ async function main() {
     `&nbsp;&nbsp;${asc.bip110.pct}% of BIP110 nodes (${fmt(asc.bip110.sybil)}/${fmt(asc.bip110.total)})`;
   document.getElementById('asn-table-body').innerHTML = at.rows.map(r =>
     `<tr class="border-b border-od-bg2">
-      <td class="py-2 px-3 font-mono" title="${escapeHtml(r.name)}">${escapeHtml(r.asn)}</td>
+      <td class="py-2 px-3 font-mono" title="${escapeHtml(r.tooltip)}">${escapeHtml(r.asn)}</td>
       <td class="text-right py-2 px-3">${fmt(r.total)}</td>
       <td class="text-right py-2 px-3">${fmt(r.core)}</td>
       <td class="text-right py-2 px-3">${fmt(r.knots)}</td>

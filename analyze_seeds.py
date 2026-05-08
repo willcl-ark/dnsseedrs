@@ -6,7 +6,6 @@
 """Analyze bitcoin DNS seeder data and produce JSON for the web dashboard."""
 
 import argparse
-import csv
 import gzip
 import json
 import os
@@ -29,8 +28,8 @@ ASMAP_URL = (
 ASMAP_DAT = SCRIPT_DIR / "latest_asmap.dat"
 ASMAP_DECODED = SCRIPT_DIR / "latest_asmap.decoded"
 ASMAP_TOOL = SCRIPT_DIR / "asmap" / "asmap-tool.py"
-ASN_CSV_URL = "https://github.com/quantcdn/asn-info/raw/refs/heads/master/as.csv"
-ASN_CSV = SCRIPT_DIR / "as.csv"
+ASN_JSON_URL = "https://github.com/quantcdn/asn-info/raw/refs/heads/master/as.json"
+ASN_JSON = SCRIPT_DIR / "as.json"
 
 
 def fetch_seeds(force: bool = False) -> None:
@@ -70,12 +69,12 @@ def decode_asmap(force: bool = False) -> None:
     print("Done.")
 
 
-def fetch_asn_csv(force: bool = False) -> None:
-    if not force and ASN_CSV.exists():
-        print(f"Using cached {ASN_CSV.name} (use --force to re-download)")
+def fetch_asn_json(force: bool = False) -> None:
+    if not force and ASN_JSON.exists():
+        print(f"Using cached {ASN_JSON.name} (use --force to re-download)")
         return
-    print(f"Downloading {ASN_CSV_URL} ...")
-    urllib.request.urlretrieve(ASN_CSV_URL, ASN_CSV)
+    print(f"Downloading {ASN_JSON_URL} ...")
+    urllib.request.urlretrieve(ASN_JSON_URL, ASN_JSON)
     print("Done.")
 
 
@@ -200,20 +199,28 @@ def load_asmap(path: Path) -> dict:
     return {"tables": tables, "lengths": lengths, "masks": masks, "path": path}
 
 
-def load_asn_names(path: Path) -> dict[str, str]:
-    names = {}
-    with open(path, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
+def load_asn_metadata(path: Path) -> dict[str, dict]:
+    metadata = {}
+    with open(path) as f:
+        for row in json.load(f):
             asn = row.get("asn")
-            description = row.get("description")
-            handle = row.get("handle")
-            if not asn:
+            if asn is None:
                 continue
-            names[f"AS{asn}"] = description or handle or f"AS{asn}"
+            row_metadata = row.get("metadata") or {}
+            description = row_metadata.get("description")
+            handle = row_metadata.get("handle")
+            category = row_metadata.get("category")
+            country = row_metadata.get("country")
+            network_role = row_metadata.get("networkRole")
+            metadata[f"AS{asn}"] = {
+                "name": description or handle or f"AS{asn}",
+                "category": category,
+                "country": country,
+                "network_role": network_role,
+            }
 
-    print(f"Loaded ASN names: {len(names):,} entries from {path}")
-    return names
+    print(f"Loaded ASN metadata: {len(metadata):,} entries from {path}")
+    return metadata
 
 
 def lookup_asn(addr: str, asmap: dict) -> str | None:
@@ -265,9 +272,38 @@ def concentration_stats(
     return cluster_totals, mean, stddev, mean + 5 * stddev
 
 
-def build_data(rows: list[dict], asmap: dict, asn_names: dict[str, str]) -> dict:
+def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> dict:
     classes = ["core", "knots", "bip110", "other"]
     labels = ["Core", "Knots (no BIP110)", "BIP110", "Other"]
+
+    def asn_info(asn: str | None) -> dict:
+        if asn is None:
+            return {
+                "name": None,
+                "category": None,
+                "country": None,
+                "network_role": None,
+                "tooltip": "ASN unknown",
+            }
+        metadata = asn_metadata.get(asn, {})
+        name = metadata.get("name") or asn
+        category = metadata.get("category")
+        country = metadata.get("country")
+        network_role = metadata.get("network_role")
+        parts = [f"{asn} - {name}"]
+        if category:
+            parts.append(f"Category: {category}")
+        if country:
+            parts.append(f"Country: {country}")
+        if network_role:
+            parts.append(f"Network role: {network_role}")
+        return {
+            "name": name,
+            "category": category,
+            "country": country,
+            "network_role": network_role,
+            "tooltip": "\n".join(parts),
+        }
 
     all_by_class = Counter()
     good_by_class = Counter()
@@ -421,10 +457,13 @@ def build_data(rows: list[dict], asmap: dict, asn_names: dict[str, str]) -> dict
     top_prefix_owner_items = []
     for prefix in top_prefixes:
         asn = lookup_asn_for_prefix(prefix, asmap)
+        info = asn_info(asn)
         top_prefix_owner_items.append(
             {
                 "asn": asn,
-                "name": asn_names.get(asn, asn) if asn else None,
+                "name": info["name"],
+                "category": info["category"],
+                "tooltip": info["tooltip"],
             }
         )
     top_prefix_series = []
@@ -445,6 +484,8 @@ def build_data(rows: list[dict], asmap: dict, asn_names: dict[str, str]) -> dict
                 "prefix": p,
                 "asn": top_prefix_owner_items[idx]["asn"],
                 "asn_name": top_prefix_owner_items[idx]["name"],
+                "asn_category": top_prefix_owner_items[idx]["category"],
+                "asn_tooltip": top_prefix_owner_items[idx]["tooltip"],
                 "total": prefix_totals[p],
                 "core": prefix_by_class[p].get("core", 0),
                 "knots": prefix_by_class[p].get("knots", 0),
@@ -479,9 +520,17 @@ def build_data(rows: list[dict], asmap: dict, asn_names: dict[str, str]) -> dict
     sybil_asns = sorted(
         asn for asn, total in asn_totals.items() if total > asn_threshold
     )
-    sybil_asn_items = [
-        {"asn": asn, "name": asn_names.get(asn, asn)} for asn in sybil_asns
-    ]
+    sybil_asn_items = []
+    for asn in sybil_asns:
+        info = asn_info(asn)
+        sybil_asn_items.append(
+            {
+                "asn": asn,
+                "name": info["name"],
+                "category": info["category"],
+                "tooltip": info["tooltip"],
+            }
+        )
 
     asn_sybil_count = 0
     asn_sybil_by_cls = Counter()
@@ -525,14 +574,20 @@ def build_data(rows: list[dict], asmap: dict, asn_names: dict[str, str]) -> dict
                 "values": [asn_by_class[asn].get(cls, 0) for asn in top_asns],
             }
         )
-    top_asn_names = [asn_names.get(asn, asn) for asn in top_asns]
+    top_asn_infos = [asn_info(asn) for asn in top_asns]
+    top_asn_names = [info["name"] for info in top_asn_infos]
+    top_asn_categories = [info["category"] for info in top_asn_infos]
+    top_asn_tooltips = [info["tooltip"] for info in top_asn_infos]
 
     asn_table = []
     for asn in top_asns:
+        info = asn_info(asn)
         asn_table.append(
             {
                 "asn": asn,
-                "name": asn_names.get(asn, asn),
+                "name": info["name"],
+                "category": info["category"],
+                "tooltip": info["tooltip"],
                 "total": asn_totals[asn],
                 "core": asn_by_class[asn].get("core", 0),
                 "knots": asn_by_class[asn].get("knots", 0),
@@ -550,6 +605,22 @@ def build_data(rows: list[dict], asmap: dict, asn_names: dict[str, str]) -> dict
             "sybil": in_sybil,
             "pct": round(in_sybil / total * 100, 1) if total else 0,
         }
+
+    category_labels = {
+        "business": "Business",
+        "education_research": "Education/research",
+        "government_admin": "Government/admin",
+        "hosting": "Hosting",
+        "isp": "ISP",
+        "unknown": "Unknown",
+    }
+    asn_by_category = Counter()
+    for asn, total in asn_totals.items():
+        category = asn_info(asn)["category"] or "unknown"
+        asn_by_category[category] += total
+    asn_category_items = sorted(
+        asn_by_category.items(), key=lambda item: item[1], reverse=True
+    )
 
     # Overview pie
     overview_labels = ["No user agent", *labels]
@@ -638,7 +709,17 @@ def build_data(rows: list[dict], asmap: dict, asn_names: dict[str, str]) -> dict
         "top_asns": {
             "labels": top_asns,
             "names": top_asn_names,
+            "categories": top_asn_categories,
+            "tooltips": top_asn_tooltips,
             "series": top_asn_series,
+        },
+        "asn_categories": {
+            "labels": [
+                category_labels.get(category, category.replace("_", " ").title())
+                for category, _ in asn_category_items
+            ],
+            "keys": [category for category, _ in asn_category_items],
+            "values": [count for _, count in asn_category_items],
         },
         "asn_table": {
             "rows": asn_table,
@@ -672,14 +753,14 @@ def main():
     decompress(args.force)
     fetch_asmap(args.force)
     decode_asmap(args.force)
-    fetch_asn_csv(args.force)
+    fetch_asn_json(args.force)
 
     print("Parsing seeds data...")
     rows = parse_seeds(SEEDS_TXT)
     asmap = load_asmap(ASMAP_DECODED)
-    asn_names = load_asn_names(ASN_CSV)
+    asn_metadata = load_asn_metadata(ASN_JSON)
 
-    data = build_data(rows, asmap, asn_names)
+    data = build_data(rows, asmap, asn_metadata)
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w") as f:
