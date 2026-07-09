@@ -1,17 +1,28 @@
 use crate::asmap::interpret;
-use crate::common::{is_good, BindProtocol, Host};
+use crate::common::{is_good, BindProtocol, Host, NodeInfo};
 use crate::db::{node_info_from_row, open_db_connection, NODE_SELECT_COLUMNS};
 use crate::dnssec::{parse_dns_keys_dir, DnsSigningKey, RecordsToSign};
 
 use std::{
     collections::{HashMap, HashSet},
+    io::BufReader as StdBufReader,
+    net::IpAddr,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
     sync::{Arc, RwLock},
     time,
 };
 
-use bitcoin::{network::Network, p2p::ServiceFlags};
+use bitcoin::{
+    consensus::{Decodable, Encodable},
+    network::Network,
+    p2p::{
+        address::Address,
+        message::{NetworkMessage, RawNetworkMessage, MAX_MSG_SIZE},
+        message_network::VersionMessage,
+        Magic, ServiceFlags,
+    },
+};
 use domain::{
     base::{
         iana::{rcode::Rcode, rtype::Rtype, Class, SecAlg},
@@ -36,8 +47,9 @@ use rand::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
-    net::{TcpListener, UdpSocket},
+    net::{TcpListener, TcpStream, UdpSocket},
     sync::Semaphore,
+    task::JoinSet,
     time::{interval, timeout},
 };
 
@@ -46,6 +58,8 @@ const IPV6_NET_GROUP_MASK: Ipv6Addr = Ipv6Addr::from_segments([0xffff, 0xffff, 0
 const IPV6_HE_NET_GROUP_MASK: Ipv6Addr =
     Ipv6Addr::from_segments([0xffff, 0xffff, 0xf000, 0, 0, 0, 0, 0]);
 const MAX_DNS_RESULTS: usize = 20;
+const DNS_CACHE_VERIFY_CONCURRENCY: usize = 40;
+const DNS_CACHE_PROBE_TIMEOUT: time::Duration = time::Duration::from_secs(5);
 const UDP_HANDLER_CONCURRENCY: usize = 1024;
 const TCP_HANDLER_CONCURRENCY: usize = 256;
 
@@ -64,6 +78,12 @@ impl CachedAddrs {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct CacheTargets {
+    ipv4: usize,
+    ipv6: usize,
+}
+
 fn sample_cached_addrs<T: Copy>(addrs: &[T], limit: usize, rng: &mut impl Rng) -> Vec<T> {
     // Answers are always chosen from the server-maintained cache. The client can choose
     // the record type and service-bit filter via the qname, but it cannot inject or
@@ -78,6 +98,308 @@ fn sample_cached_addrs<T: Copy>(addrs: &[T], limit: usize, rng: &mut impl Rng) -
         .into_iter()
         .map(|i| addrs[i])
         .collect()
+}
+
+fn ipv4_diversity_key(addr: Ipv4Addr, asmap: Option<&[bool]>) -> u128 {
+    if let Some(asmap_data) = asmap {
+        let ip_bits = ipv4_mapped_asmap_bits(addr);
+        return u128::from(interpret(asmap_data, &ip_bits));
+    }
+
+    u128::from(u32::from(addr & IPV4_NET_GROUP_MASK))
+}
+
+fn ipv6_diversity_key(addr: Ipv6Addr, asmap: Option<&[bool]>) -> u128 {
+    if let Some(asmap_data) = asmap {
+        let ip_bits = ipv6_asmap_bits(addr);
+        return u128::from(interpret(asmap_data, &ip_bits));
+    }
+
+    let group: Ipv6Addr = if addr.octets()[0] == 0x20
+        && addr.octets()[1] == 0x01
+        && addr.octets()[2] == 0x04
+        && addr.octets()[3] == 0x70
+    {
+        addr & IPV6_HE_NET_GROUP_MASK
+    } else {
+        addr & IPV6_NET_GROUP_MASK
+    };
+    u128::from_be_bytes(group.octets())
+}
+
+fn add_verified_node_to_cache(
+    node: &NodeInfo,
+    filters: &[ServiceFlags],
+    cache: &mut HashMap<ServiceFlags, CachedAddrs>,
+    ipv4_keys: &mut HashMap<ServiceFlags, HashSet<u128>>,
+    ipv6_keys: &mut HashMap<ServiceFlags, HashSet<u128>>,
+    asmap: Option<&[bool]>,
+) {
+    let services = ServiceFlags::from(node.services);
+    for filter in filters {
+        if !services.has(*filter) {
+            continue;
+        }
+        let Some(addrs) = cache.get_mut(filter) else {
+            continue;
+        };
+        match node.addr.host {
+            Host::Ipv4(ip) if addrs.ipv4.len() < MAX_DNS_RESULTS => {
+                let key = ipv4_diversity_key(ip, asmap);
+                if ipv4_keys.entry(*filter).or_default().insert(key) {
+                    addrs.ipv4.push(ip);
+                }
+            }
+            Host::Ipv6(ip) if addrs.ipv6.len() < MAX_DNS_RESULTS => {
+                let key = ipv6_diversity_key(ip, asmap);
+                if ipv6_keys.entry(*filter).or_default().insert(key) {
+                    addrs.ipv6.push(ip);
+                }
+            }
+            _ => (),
+        }
+    }
+}
+
+fn cache_targets(
+    candidates: &[NodeInfo],
+    filters: &[ServiceFlags],
+    asmap: Option<&[bool]>,
+) -> HashMap<ServiceFlags, CacheTargets> {
+    let mut ipv4_keys = HashMap::<ServiceFlags, HashSet<u128>>::new();
+    let mut ipv6_keys = HashMap::<ServiceFlags, HashSet<u128>>::new();
+
+    for node in candidates {
+        let services = ServiceFlags::from(node.services);
+        for filter in filters {
+            if !services.has(*filter) {
+                continue;
+            }
+            match node.addr.host {
+                Host::Ipv4(ip) => {
+                    ipv4_keys
+                        .entry(*filter)
+                        .or_default()
+                        .insert(ipv4_diversity_key(ip, asmap));
+                }
+                Host::Ipv6(ip) => {
+                    ipv6_keys
+                        .entry(*filter)
+                        .or_default()
+                        .insert(ipv6_diversity_key(ip, asmap));
+                }
+                _ => (),
+            }
+        }
+    }
+
+    filters
+        .iter()
+        .map(|filter| {
+            let ipv4 = ipv4_keys
+                .get(filter)
+                .map_or(0, |keys| keys.len().min(MAX_DNS_RESULTS));
+            let ipv6 = ipv6_keys
+                .get(filter)
+                .map_or(0, |keys| keys.len().min(MAX_DNS_RESULTS));
+            (*filter, CacheTargets { ipv4, ipv6 })
+        })
+        .collect()
+}
+
+fn cache_has_targets(
+    cache: &HashMap<ServiceFlags, CachedAddrs>,
+    targets: &HashMap<ServiceFlags, CacheTargets>,
+) -> bool {
+    targets.iter().all(|(filter, target)| {
+        let Some(addrs) = cache.get(filter) else {
+            return target.ipv4 == 0 && target.ipv6 == 0;
+        };
+        addrs.ipv4.len() >= target.ipv4 && addrs.ipv6.len() >= target.ipv6
+    })
+}
+
+async fn probe_bitcoin_v1_version(
+    stream: &mut TcpStream,
+    node: &NodeInfo,
+    chain: Network,
+) -> Result<(), std::io::Error> {
+    let addr_them = match node.addr.host {
+        Host::Ipv4(ip) => Address {
+            services: ServiceFlags::NONE,
+            address: ip.to_ipv6_mapped().segments(),
+            port: node.addr.port,
+        },
+        Host::Ipv6(ip) => Address {
+            services: ServiceFlags::NONE,
+            address: ip.segments(),
+            port: node.addr.port,
+        },
+        _ => return Err(std::io::Error::other("unsupported DNS cache probe host")),
+    };
+    let addr_me = Address {
+        services: ServiceFlags::NONE,
+        address: [0, 0, 0, 0, 0, 0, 0, 0],
+        port: 0,
+    };
+    let ver_msg = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NONE,
+        timestamp: i64::try_from(
+            time::SystemTime::now()
+                .duration_since(time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap(),
+        receiver: addr_them,
+        sender: addr_me,
+        nonce: 0,
+        user_agent: "/dnsseedrs:0.2.0/".to_string(),
+        start_height: -1,
+        relay: false,
+    };
+
+    let net_magic = chain.magic();
+    let mut write_buf = Vec::<u8>::new();
+    RawNetworkMessage::new(net_magic, NetworkMessage::Version(ver_msg))
+        .consensus_encode(&mut write_buf)?;
+    stream.write_all(&write_buf).await?;
+    stream.flush().await?;
+
+    let mut reader = BufReader::new(stream);
+    loop {
+        let mut msg = vec![0_u8; 4];
+        reader.read_exact(msg.as_mut_slice()).await?;
+        while msg.as_slice() != <Magic as AsRef<[u8]>>::as_ref(&net_magic) {
+            msg.drain(0..1);
+            let mut next_byte = [0_u8; 1];
+            reader.read_exact(&mut next_byte).await?;
+            msg.extend(next_byte);
+        }
+
+        let mut cmd = [0_u8; 12];
+        reader.read_exact(&mut cmd).await?;
+        msg.extend(cmd);
+
+        let mut len_bytes = [0_u8; 4];
+        reader.read_exact(&mut len_bytes).await?;
+        let data_len = u32::from_le_bytes(len_bytes);
+        msg.extend(len_bytes);
+        if data_len as usize > MAX_MSG_SIZE {
+            return Err(std::io::Error::other("message exceeds max length"));
+        }
+
+        let mut data = vec![0; data_len as usize];
+        reader.read_exact(data.as_mut_slice()).await?;
+        msg.extend(data);
+
+        let mut checksum = [0_u8; 4];
+        reader.read_exact(&mut checksum).await?;
+        msg.extend(checksum);
+
+        let mut msg_reader = StdBufReader::new(msg.as_slice());
+        let msg = RawNetworkMessage::consensus_decode(&mut msg_reader)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        if let NetworkMessage::Version(_) = msg.payload() {
+            return Ok(());
+        }
+    }
+}
+
+async fn probe_dns_cache_candidate(node: NodeInfo, chain: Network) -> Option<NodeInfo> {
+    let socket_addr = match node.addr.host {
+        Host::Ipv4(ip) => SocketAddr::new(IpAddr::V4(ip), node.addr.port),
+        Host::Ipv6(ip) => SocketAddr::new(IpAddr::V6(ip), node.addr.port),
+        _ => return None,
+    };
+
+    let mut stream = match timeout(DNS_CACHE_PROBE_TIMEOUT, TcpStream::connect(socket_addr)).await {
+        Ok(Ok(stream)) => stream,
+        _ => return None,
+    };
+    match timeout(
+        DNS_CACHE_PROBE_TIMEOUT,
+        probe_bitcoin_v1_version(&mut stream, &node, chain),
+    )
+    .await
+    {
+        Ok(Ok(())) => Some(node),
+        _ => None,
+    }
+}
+
+async fn build_verified_cache(
+    mut candidates: Vec<NodeInfo>,
+    seeder: &SeederInfo,
+    asmap: Option<&[bool]>,
+) -> (HashMap<ServiceFlags, CachedAddrs>, usize) {
+    {
+        let mut rng = thread_rng();
+        candidates.shuffle(&mut rng);
+    }
+
+    let filters = seeder
+        .allowed_filters
+        .values()
+        .copied()
+        .collect::<Vec<ServiceFlags>>();
+    let targets = cache_targets(&candidates, &filters, asmap);
+
+    let mut new_cache = HashMap::<ServiceFlags, CachedAddrs>::new();
+    for filter in &filters {
+        new_cache.insert(*filter, CachedAddrs::new());
+    }
+
+    if cache_has_targets(&new_cache, &targets) {
+        return (new_cache, 0);
+    }
+
+    let mut ipv4_keys = HashMap::<ServiceFlags, HashSet<u128>>::new();
+    let mut ipv6_keys = HashMap::<ServiceFlags, HashSet<u128>>::new();
+    let mut join_set = JoinSet::<Option<NodeInfo>>::new();
+    let mut next_candidate = 0_usize;
+    let mut verified_nodes = 0_usize;
+
+    while next_candidate < candidates.len()
+        && join_set.len() < DNS_CACHE_VERIFY_CONCURRENCY
+        && !cache_has_targets(&new_cache, &targets)
+    {
+        let node = candidates[next_candidate].clone();
+        next_candidate += 1;
+        let chain = seeder.chain;
+        join_set.spawn(async move { probe_dns_cache_candidate(node, chain).await });
+    }
+
+    while let Some(result) = join_set.join_next().await {
+        if let Ok(Some(node)) = result {
+            verified_nodes += 1;
+            add_verified_node_to_cache(
+                &node,
+                &filters,
+                &mut new_cache,
+                &mut ipv4_keys,
+                &mut ipv6_keys,
+                asmap,
+            );
+        }
+
+        while next_candidate < candidates.len()
+            && join_set.len() < DNS_CACHE_VERIFY_CONCURRENCY
+            && !cache_has_targets(&new_cache, &targets)
+        {
+            let node = candidates[next_candidate].clone();
+            next_candidate += 1;
+            let chain = seeder.chain;
+            join_set.spawn(async move { probe_dns_cache_candidate(node, chain).await });
+        }
+
+        if cache_has_targets(&new_cache, &targets) {
+            break;
+        }
+    }
+
+    (new_cache, verified_nodes)
 }
 
 fn write_bits_from_octets(bits: &mut [bool], octets: &[u8]) {
@@ -716,113 +1038,35 @@ async fn fill_cache(
         let refill_start = time::Instant::now();
         info!("Starting DNS cache refill from db");
 
-        // Fill the cache
-        let mut new_cache = HashMap::<ServiceFlags, CachedAddrs>::new();
-        for filter in seeder.allowed_filters.values() {
-            new_cache.insert(*filter, CachedAddrs::new());
-        }
-
-        // Get nodes from db
-        let mut select_nodes = db_conn
-            .prepare(&format!(
-                "SELECT {NODE_SELECT_COLUMNS} FROM nodes WHERE try_count > 0"
-            ))
-            .unwrap();
-        let node_iter = select_nodes.query_map([], node_info_from_row).unwrap();
-
         let mut scanned_nodes = 0_usize;
-        let mut good_nodes = 0_usize;
-        for node_res in node_iter {
-            scanned_nodes += 1;
-            let node = node_res.unwrap().unwrap();
-            if !is_good(&node, &seeder.chain) {
-                continue;
-            }
-            good_nodes += 1;
-            for (filter, addrs) in &mut new_cache {
-                if ServiceFlags::from(node.services).has(*filter) {
-                    match node.addr.host {
-                        Host::Ipv4(ip) => addrs.ipv4.push(ip),
-                        Host::Ipv6(ip) => addrs.ipv6.push(ip),
-                        _ => continue,
-                    }
-                }
-            }
-        }
+        let candidates = {
+            let mut candidates = Vec::<NodeInfo>::new();
+            let mut select_nodes = db_conn
+                .prepare(&format!(
+                    "SELECT {NODE_SELECT_COLUMNS} FROM nodes WHERE try_count > 0"
+                ))
+                .unwrap();
+            let node_iter = select_nodes.query_map([], node_info_from_row).unwrap();
 
-        // Shuffle cached nodes and truncate to 100 nodes each
-        let mut rng = thread_rng();
-        for (service_bits, addrs) in new_cache.iter_mut() {
-            debug!("Cache for service bits {}", service_bits);
-            addrs.ipv4.shuffle(&mut rng);
-            let mut final_ipv4 = Vec::<Ipv4Addr>::with_capacity(100);
-            let mut ipv4_groups = HashSet::<Ipv4Addr>::with_capacity(100);
-            let mut ipv4_asns = HashSet::<u32>::with_capacity(100);
-            for addr in &addrs.ipv4 {
-                if let Some(asmap_data) = &asmap {
-                    let ip_bits = ipv4_mapped_asmap_bits(*addr);
-                    let asn = interpret(asmap_data, &ip_bits);
-                    if ipv4_asns.insert(asn) {
-                        debug!("Adding {}, ASN {} to cache", addr, asn);
-                        final_ipv4.push(*addr);
-                        if final_ipv4.len() >= 100 {
-                            break;
-                        }
-                    }
-                } else {
-                    // Get the /16 group
-                    let group = addr & IPV4_NET_GROUP_MASK;
-                    if !ipv4_groups.contains(&group) {
-                        debug!("Adding {}, Group {} to cache", addr, group);
-                        ipv4_groups.insert(group);
-                        final_ipv4.push(*addr);
-                        if final_ipv4.len() >= 100 {
-                            break;
-                        }
-                    }
+            for node_res in node_iter {
+                scanned_nodes += 1;
+                let Ok(Some(node)) = node_res else {
+                    continue;
+                };
+                if !is_good(&node, &seeder.chain) {
+                    continue;
+                }
+                match node.addr.host {
+                    Host::Ipv4(..) | Host::Ipv6(..) => candidates.push(node),
+                    _ => (),
                 }
             }
-            addrs.ipv4 = final_ipv4;
+            candidates
+        };
 
-            addrs.ipv6.shuffle(&mut rng);
-            let mut final_ipv6 = Vec::<Ipv6Addr>::with_capacity(100);
-            let mut ipv6_groups = HashSet::<Ipv6Addr>::with_capacity(100);
-            let mut ipv6_asns = HashSet::<u32>::with_capacity(100);
-            for addr in &addrs.ipv6 {
-                if let Some(asmap_data) = &asmap {
-                    let ip_bits = ipv6_asmap_bits(*addr);
-                    let asn = interpret(asmap_data, &ip_bits);
-                    if ipv6_asns.insert(asn) {
-                        debug!("Adding {}, ASN {} to cache", addr, asn);
-                        final_ipv6.push(*addr);
-                        if final_ipv6.len() >= 100 {
-                            break;
-                        }
-                    }
-                } else {
-                    // Check for Hurricane Electric and use /36 group if so
-                    let group: Ipv6Addr = if addr.octets()[0] == 0x20
-                        && addr.octets()[1] == 0x01
-                        && addr.octets()[2] == 0x04
-                        && addr.octets()[3] == 0x70
-                    {
-                        addr & IPV6_HE_NET_GROUP_MASK
-                    } else {
-                        // Get the /32 group
-                        addr & IPV6_NET_GROUP_MASK
-                    };
-                    if !ipv6_groups.contains(&group) {
-                        debug!("Adding {}, Group {} to cache", addr, group);
-                        ipv6_groups.insert(group);
-                        final_ipv6.push(*addr);
-                        if final_ipv6.len() >= 100 {
-                            break;
-                        }
-                    }
-                }
-            }
-            addrs.ipv6 = final_ipv6
-        }
+        let candidate_nodes = candidates.len();
+        let (new_cache, verified_nodes) =
+            build_verified_cache(candidates, &seeder, asmap.as_deref()).await;
 
         {
             let mut cache_write = cache.write().unwrap();
@@ -838,10 +1082,11 @@ async fn fill_cache(
                 .sum::<usize>()
         };
         info!(
-            "Finished DNS cache refill from db in {:?}: scanned_nodes={}, good_nodes={}, cached_addrs={}",
+            "Finished DNS cache refill from db in {:?}: scanned_nodes={}, candidate_nodes={}, verified_nodes={}, cached_addrs={}",
             refill_start.elapsed(),
             scanned_nodes,
-            good_nodes,
+            candidate_nodes,
+            verified_nodes,
             cached_addrs
         );
     }
@@ -894,12 +1139,36 @@ pub async fn dns_thread(
 
 #[cfg(test)]
 mod tests {
-    use super::{ipv4_mapped_asmap_bits, ipv6_asmap_bits, sample_cached_addrs};
+    use super::{
+        add_verified_node_to_cache, cache_targets, ipv4_mapped_asmap_bits, ipv6_asmap_bits,
+        sample_cached_addrs, CachedAddrs, MAX_DNS_RESULTS,
+    };
+    use crate::common::NodeInfo;
+    use bitcoin::p2p::ServiceFlags;
     use rand::{rngs::StdRng, SeedableRng};
     use std::{
-        collections::HashSet,
+        collections::{HashMap, HashSet},
         net::{Ipv4Addr, Ipv6Addr},
     };
+
+    fn node_info(address: String, services: ServiceFlags) -> NodeInfo {
+        NodeInfo::construct(
+            address,
+            0,
+            0,
+            "".to_string(),
+            services.to_u64(),
+            880000,
+            70016,
+            10,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn sample_cached_addrs_returns_all_items_when_under_limit() {
@@ -940,5 +1209,42 @@ mod tests {
         assert!(bits[0]);
         assert!(bits[1..127].iter().all(|bit| !*bit));
         assert!(bits[127]);
+    }
+
+    #[test]
+    fn cache_targets_cap_each_family_at_dns_result_limit() {
+        let filter = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let filters = vec![filter];
+        let candidates = (101..=125)
+            .map(|octet| node_info(format!("{octet}.1.1.1:8333"), filter))
+            .collect::<Vec<_>>();
+
+        let targets = cache_targets(&candidates, &filters, None);
+
+        assert_eq!(targets.get(&filter).unwrap().ipv4, MAX_DNS_RESULTS);
+        assert_eq!(targets.get(&filter).unwrap().ipv6, 0);
+    }
+
+    #[test]
+    fn verified_cache_keeps_one_ipv4_per_16_without_asmap() {
+        let filter = ServiceFlags::NETWORK | ServiceFlags::WITNESS;
+        let filters = vec![filter];
+        let mut cache = HashMap::from([(filter, CachedAddrs::new())]);
+        let mut ipv4_keys = HashMap::new();
+        let mut ipv6_keys = HashMap::new();
+
+        for address in ["1.2.3.4:8333", "1.2.4.5:8333"] {
+            let node = node_info(address.to_string(), filter);
+            add_verified_node_to_cache(
+                &node,
+                &filters,
+                &mut cache,
+                &mut ipv4_keys,
+                &mut ipv6_keys,
+                None,
+            );
+        }
+
+        assert_eq!(cache.get(&filter).unwrap().ipv4.len(), 1);
     }
 }
