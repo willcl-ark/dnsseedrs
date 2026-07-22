@@ -14,10 +14,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: cachix/install-nix-action@v31
-      - run: nix flake check
+      - run: nix flake check --no-update-lock-file
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: cachix/install-nix-action@v31
-      - run: nix build
+      - run: nix build --no-update-lock-file

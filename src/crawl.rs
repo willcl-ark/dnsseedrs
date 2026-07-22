@@ -356,7 +356,7 @@ async fn get_node_addrs_v1(
                 }));
             }
             NetworkMessage::Addr(addrs) => {
-                debug!("Received addrv1 from {}", &node.addr.to_string());
+                debug!("Received addrv1 from {}", node.addr);
                 for (_, a) in addrs {
                     if let Ok(s) = a.socket_addr() {
                         if let Ok(mut new_info) = NodeInfo::new(s.to_string()) {
@@ -371,14 +371,14 @@ async fn get_node_addrs_v1(
                 break;
             }
             NetworkMessage::AddrV2(addrs) => {
-                debug!("Received addrv2 from {}", &node.addr.to_string());
+                debug!("Received addrv2 from {}", node.addr);
                 for a in addrs {
                     let addrstr = match a.addr {
                         AddrV2::Ipv4(..) | AddrV2::Ipv6(..) => match a.socket_addr() {
                             Ok(s) => Ok(s.to_string()),
                             Err(..) => Err("IP type address couldn't be turned into SocketAddr"),
                         },
-                        AddrV2::Cjdns(ip) => Ok(format!("[{}]:{}", ip, &a.port.to_string())),
+                        AddrV2::Cjdns(ip) => Ok(format!("[{}]:{}", ip, a.port)),
                         AddrV2::TorV2(..) => Err("who's advertising torv2????"),
                         AddrV2::TorV3(host) => {
                             let mut to_hash: Vec<u8> = vec![];
@@ -395,14 +395,14 @@ async fn get_node_addrs_v1(
                             Ok(format!(
                                 "{}.onion:{}",
                                 Base32Unpadded::encode_string(&to_enc).trim_matches(char::from(0)),
-                                &a.port.to_string()
+                                a.port
                             )
                             .to_string())
                         }
                         AddrV2::I2p(host) => Ok(format!(
                             "{}.b32.i2p:{}",
                             Base32Unpadded::encode_string(&host),
-                            &a.port.to_string()
+                            a.port
                         )
                         .to_string()),
                         _ => Err("unknown"),
@@ -569,7 +569,7 @@ async fn get_node_addrs_v2(
                 }));
             }
             NetworkMessage::Addr(addrs) => {
-                debug!("Received addrv1 from {}", &node.addr.to_string());
+                debug!("Received addrv1 from {}", node.addr);
                 for (_, a) in addrs {
                     if let Ok(s) = a.socket_addr() {
                         if let Ok(mut new_info) = NodeInfo::new(s.to_string()) {
@@ -584,14 +584,14 @@ async fn get_node_addrs_v2(
                 break;
             }
             NetworkMessage::AddrV2(addrs) => {
-                debug!("Received addrv2 from {}", &node.addr.to_string());
+                debug!("Received addrv2 from {}", node.addr);
                 for a in addrs {
                     let addrstr = match a.addr {
                         AddrV2::Ipv4(..) | AddrV2::Ipv6(..) => match a.socket_addr() {
                             Ok(s) => Ok(s.to_string()),
                             Err(..) => Err("IP type address couldn't be turned into SocketAddr"),
                         },
-                        AddrV2::Cjdns(ip) => Ok(format!("[{}]:{}", ip, &a.port.to_string())),
+                        AddrV2::Cjdns(ip) => Ok(format!("[{}]:{}", ip, a.port)),
                         AddrV2::TorV2(..) => Err("who's advertising torv2????"),
                         AddrV2::TorV3(host) => {
                             let mut to_hash: Vec<u8> = vec![];
@@ -608,14 +608,14 @@ async fn get_node_addrs_v2(
                             Ok(format!(
                                 "{}.onion:{}",
                                 Base32Unpadded::encode_string(&to_enc).trim_matches(char::from(0)),
-                                &a.port.to_string()
+                                a.port
                             )
                             .to_string())
                         }
                         AddrV2::I2p(host) => Ok(format!(
                             "{}.b32.i2p:{}",
                             Base32Unpadded::encode_string(&host),
-                            &a.port.to_string()
+                            a.port
                         )
                         .to_string()),
                         _ => Err("unknown"),
@@ -716,27 +716,23 @@ async fn crawl_node(node: &NodeInfo, net_status: NetStatus) -> Vec<CrawledNode> 
     let age = tried_timestamp - node.last_tried;
     let mut ret_addrs = Vec::<CrawledNode>::new();
 
-    debug!(
-        "Trying {}, current try = {}",
-        &node.addr.to_string(),
-        node.try_count + 1
-    );
+    debug!("Trying {}, current try = {}", node.addr, node.try_count + 1);
 
     let v2_conn_res = connect_node(node, &net_status).await;
     if let Err(v2_conn_err) = v2_conn_res {
         if v2_conn_err.is::<NetNotAvailableError>() {
-            debug!("Network not available for {}", &node.addr.to_string());
+            debug!("Network not available for {}", node.addr);
         } else {
             let mut node_info = node.clone();
             node_info.last_tried = tried_timestamp;
             ret_addrs.push(CrawledNode::Failed(CrawlInfo { node_info, age }));
-            debug!("Failed connect: {}", &node.addr.to_string());
+            debug!("Failed connect: {}", node.addr);
         }
         return ret_addrs;
     }
     let mut v2_sock = v2_conn_res.unwrap();
 
-    debug!("Connected to {} for v2 crawl", &node.addr.to_string());
+    debug!("Connected to {} for v2 crawl", node.addr);
 
     match timeout(
         time::Duration::from_secs(30),
@@ -751,14 +747,14 @@ async fn crawl_node(node: &NodeInfo, net_status: NetStatus) -> Vec<CrawledNode> 
                     let mut node_info = node.clone();
                     node_info.last_tried = tried_timestamp;
                     ret_addrs.push(CrawledNode::Failed(CrawlInfo { node_info, age }));
-                    debug!("Failed crawl: {}, {}", &node.addr.to_string(), v2_err);
+                    debug!("Failed crawl: {}, {}", node.addr, v2_err);
                     let _ = v2_sock.shutdown().await;
                     return ret_addrs;
                 }
             }
         },
         Err(_) => {
-            debug!("{} v2 connection timed out", &node.addr.to_string());
+            debug!("{} v2 connection timed out", node.addr);
         }
     };
     let _ = v2_sock.shutdown().await;
@@ -770,12 +766,12 @@ async fn crawl_node(node: &NodeInfo, net_status: NetStatus) -> Vec<CrawledNode> 
             let mut node_info = node.clone();
             node_info.last_tried = tried_timestamp;
             ret_addrs.push(CrawledNode::Failed(CrawlInfo { node_info, age }));
-            debug!("Failed connect: {}", &node.addr.to_string());
+            debug!("Failed connect: {}", node.addr);
             return ret_addrs;
         }
         let mut v1_sock = v1_conn_res.unwrap();
 
-        debug!("Connected to {} for v1 crawl", &node.addr.to_string());
+        debug!("Connected to {} for v1 crawl", node.addr);
 
         match timeout(
             time::Duration::from_secs(30),
@@ -789,13 +785,13 @@ async fn crawl_node(node: &NodeInfo, net_status: NetStatus) -> Vec<CrawledNode> 
                     let mut node_info = node.clone();
                     node_info.last_tried = tried_timestamp;
                     ret_addrs.push(CrawledNode::Failed(CrawlInfo { node_info, age }));
-                    debug!("Failed crawl: {}, {}", &node.addr.to_string(), v1_err);
+                    debug!("Failed crawl: {}, {}", node.addr, v1_err);
                     let _ = v1_sock.shutdown().await;
                     return ret_addrs;
                 }
             },
             Err(_) => {
-                debug!("{} v1 connection timed out", &node.addr.to_string());
+                debug!("{} v1 connection timed out", node.addr);
                 let mut node_info = node.clone();
                 node_info.last_tried = tried_timestamp;
                 ret_addrs.push(CrawledNode::Failed(CrawlInfo { node_info, age }));
@@ -806,7 +802,7 @@ async fn crawl_node(node: &NodeInfo, net_status: NetStatus) -> Vec<CrawledNode> 
         let _ = v1_sock.shutdown().await;
     }
 
-    debug!("Done {}", &node.addr.to_string());
+    debug!("Done {}", node.addr);
     ret_addrs
 }
 
