@@ -6,6 +6,9 @@ on:
     branches: [main]
     paths:
       - analyze_seeds.py
+      - package.json
+      - package-lock.json
+      - tailwind.config.js
       - web/**
       - .github/workflows/pages.yml
   workflow_dispatch:
@@ -24,6 +27,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build:css
       - uses: astral-sh/setup-uv@v6
       - run: uv run analyze_seeds.py --output web/data.json
       - uses: actions/upload-pages-artifact@v4
