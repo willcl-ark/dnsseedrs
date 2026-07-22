@@ -24,6 +24,7 @@
           inputsFrom = [ dnsseedrs ];
           packages = [
             pkgs.cargo
+            pkgs.clippy
             pkgs.rustc
             pkgs.rustfmt
             pkgs.rust-analyzer (pkgs.python313.withPackages (ps: [ ps.plotly ])) ];

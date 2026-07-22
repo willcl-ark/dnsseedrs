@@ -861,10 +861,7 @@ fn refill_queue_for_transport(
         node_info_from_row,
     )?;
     let nodes = node_iter
-        .filter_map(|node| match node {
-            Ok(ni) => ni,
-            Err(..) => None,
-        })
+        .filter_map(|node| node.unwrap_or_default())
         .collect::<Vec<_>>();
     drop(select_nodes);
 
