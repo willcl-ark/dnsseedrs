@@ -342,6 +342,15 @@ table {
   border-collapse: collapse;
 }
 
+.network-table {
+  min-width: 0;
+  table-layout: fixed;
+}
+
+.network-table thead th {
+  white-space: normal;
+}
+
 .compact-table {
   min-width: 0;
   table-layout: fixed;
