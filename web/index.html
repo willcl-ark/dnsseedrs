@@ -171,6 +171,8 @@
                 <th class="num">Other</th>
                 <th class="num">Prefixes</th>
                 <th class="num">Largest prefix</th>
+                <th class="num" title="Distinct combinations of user agent, service flags, and protocol version">Fingerprints</th>
+                <th class="num" title="Share matching the most common fingerprint in this ASN">Dominant fingerprint</th>
               </tr>
             </thead>
             <tbody id="asn-table"></tbody>
@@ -192,8 +194,8 @@
                 <th class="num">Total</th>
                 <th class="num">Core</th>
                 <th class="num">Other</th>
-                <th class="num">Fingerprints</th>
-                <th class="num">Dominant fingerprint</th>
+                <th class="num" title="Distinct combinations of user agent, service flags, and protocol version">Fingerprints</th>
+                <th class="num" title="Share matching the most common fingerprint in this prefix">Dominant fingerprint</th>
               </tr>
             </thead>
             <tbody id="prefix-table"></tbody>
@@ -416,12 +418,14 @@ function render() {
           <td class="num">${fmt(row.other)}</td>
           <td class="num">${fmt(row.distinct_prefixes)}</td>
           <td class="num">${pct(row.largest_prefix_share)}</td>
+          <td class="num">${fmt(row.distinct_fingerprints)}</td>
+          <td class="num">${pct(row.dominant_fingerprint_share)}</td>
         </tr>
       `).join("");
 
       $("prefix-stats").textContent = prefixTable.stats
-        ? `${fmt(prefixTable.stats.distinct_prefixes || infra.distinct_prefixes)} routable prefixes; table is sorted by good node count`
-        : "Table is sorted by good node count";
+        ? `${fmt(prefixTable.stats.distinct_prefixes || infra.distinct_prefixes)} routable prefixes; table is sorted by good node count. Fingerprints are distinct combinations of reported user agent, service flags, and protocol version; dominant fingerprint is the share matching the most common combination in that prefix.`
+        : "Table is sorted by good node count. Fingerprints combine reported user agent, service flags, and protocol version; dominant fingerprint is the share matching the most common combination in that prefix.";
       $("prefix-table").innerHTML = prefixTable.rows.map((row) => `
         <tr title="${escapeAttr(row.asn_tooltip)}">
           <th scope="row" class="mono">${escapeHtml(row.prefix)}</th>

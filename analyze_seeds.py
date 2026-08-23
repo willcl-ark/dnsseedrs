@@ -451,6 +451,7 @@ def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> 
 
     asn_by_class = {}
     asn_prefixes = {}
+    asn_fingerprints = {}
     for r in good_rows:
         asn = lookup_asn(r["address"], asmap)
         prefix = extract_prefix(r["address"])
@@ -458,6 +459,12 @@ def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> 
             continue
         asn_by_class.setdefault(asn, Counter())[classify_agent(r["user_agent"])] += 1
         asn_prefixes.setdefault(asn, Counter())[prefix] += 1
+        fingerprint = (
+            r["user_agent"],
+            r["services"],
+            r["protocol_version"],
+        )
+        asn_fingerprints.setdefault(asn, Counter())[fingerprint] += 1
     asn_totals = {
         asn: sum(counts.values()) for asn, counts in asn_by_class.items()
     }
@@ -467,6 +474,7 @@ def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> 
     for asn in top_asns:
         info = asn_info(asn)
         prefix_counts = asn_prefixes[asn]
+        fingerprints = asn_fingerprints[asn]
         asn_table.append(
             {
                 "asn": asn,
@@ -479,6 +487,10 @@ def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> 
                 "distinct_prefixes": len(prefix_counts),
                 "largest_prefix_share": percentage(
                     max(prefix_counts.values()), asn_totals[asn]
+                ),
+                "distinct_fingerprints": len(fingerprints),
+                "dominant_fingerprint_share": percentage(
+                    max(fingerprints.values()), asn_totals[asn]
                 ),
             }
         )
