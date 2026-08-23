@@ -4,5 +4,5 @@ _default:
 analyze *args:
     uv run analyze_seeds.py --output web/data.json {{args}}
 
-serve: analyze
+serve *args: (analyze args)
     python3 -m http.server 8000 -d web

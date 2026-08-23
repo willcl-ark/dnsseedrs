@@ -17,6 +17,7 @@ import urllib.request
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+from statistics import median
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SEEDS_URL = "https://bitcoin.fish.foo/seeds.txt.gz"
@@ -30,6 +31,13 @@ ASMAP_DECODED = SCRIPT_DIR / "latest_asmap.decoded"
 ASMAP_TOOL = SCRIPT_DIR / "asmap" / "asmap-tool.py"
 ASN_JSON_URL = "https://github.com/quantcdn/asn-info/raw/refs/heads/master/as.json"
 ASN_JSON = SCRIPT_DIR / "as.json"
+RELIABILITY_WINDOWS = ["2h", "8h", "1d", "1w", "1m"]
+SERVICE_FLAGS = [
+    ("P2P v2", "p2p_v2", 1 << 11),
+    ("Witness", "witness", 1 << 3),
+    ("Compact filters", "compact_filters", 1 << 6),
+    ("Bloom filters", "bloom", 1 << 2),
+]
 
 
 def fetch_seeds(force: bool = False) -> None:
@@ -95,6 +103,14 @@ def parse_seeds(path: str) -> list[dict]:
                 {
                     "address": parts[0],
                     "good": int(parts[1]),
+                    "last_seen": int(parts[2]),
+                    "reliability": {
+                        window: float(value.rstrip("%")) / 100
+                        for window, value in zip(RELIABILITY_WINDOWS, parts[3:8])
+                    },
+                    "blocks": int(parts[8]),
+                    "services": int(parts[9], 16),
+                    "protocol_version": int(parts[10]),
                     "user_agent": user_agent,
                 }
             )
@@ -135,28 +151,9 @@ def classify_network(addr: str) -> str:
 
 
 def classify_agent(ua: str) -> str:
-    if not ua:
-        return "unknown"
-    ua_lower = ua.lower()
-    if "knots" in ua_lower:
-        return "knots"
-    cleaned = re.sub(r"\([^)]*\)", "", ua).strip("/")
-    parts = [p for p in cleaned.split("/") if p]
-    if len(parts) == 1 and parts[0].startswith("Satoshi:"):
+    if any(part.startswith("Satoshi:") for part in ua.strip("/").split("/")):
         return "core"
     return "other"
-
-
-def extract_version(ua: str) -> str:
-    ua = ua.strip("/")
-    parts = ua.split("/")
-    clean = [p.split("(")[0].strip() for p in parts if p]
-    if not clean:
-        return ua or "unknown"
-    knots = [p for p in clean if "Knots" in p]
-    if knots:
-        return knots[0]
-    return clean[0]
 
 
 def load_asmap(path: Path) -> dict:
@@ -252,24 +249,9 @@ def lookup_asn_for_prefix(prefix: str, asmap: dict) -> str | None:
     return lookup_asn_for_ip(network.network_address, asmap)
 
 
-def concentration_stats(
-    cluster_by_class: dict[str, Counter],
-) -> tuple[dict[str, int], float, float, float]:
-    cluster_totals = {
-        key: sum(counts.values()) for key, counts in cluster_by_class.items()
-    }
-    counts = list(cluster_totals.values())
-    if not counts:
-        return cluster_totals, 0.0, 0.0, 0.0
-    mean = sum(counts) / len(counts)
-    variance = sum((count - mean) ** 2 for count in counts) / len(counts)
-    stddev = variance**0.5
-    return cluster_totals, mean, stddev, mean + 5 * stddev
-
-
 def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> dict:
-    classes = ["core", "knots", "other"]
-    labels = ["Bitcoin Core", "Knots", "Other"]
+    classes = ["core", "other"]
+    labels = ["Bitcoin Core", "Other"]
 
     def asn_info(asn: str | None) -> dict:
         if asn is None:
@@ -300,282 +282,191 @@ def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> 
             "tooltip": "\n".join(parts),
         }
 
-    all_by_class = Counter()
-    good_by_class = Counter()
-    for r in rows:
-        cls = classify_agent(r["user_agent"])
-        all_by_class[cls] += 1
-        if r["good"]:
-            good_by_class[cls] += 1
+    def percentage(part: int, whole: int) -> float:
+        return round(part / whole * 100, 1) if whole else 0.0
 
-    unknown_known = all_by_class.pop("unknown", 0)
-    good_by_class.pop("unknown", 0)
+    contacted_rows = [r for r in rows if r["last_seen"] > 0]
+    good_rows = [r for r in rows if r["good"]]
+    no_handshake = len(rows) - len(contacted_rows)
 
-    known_vals = [all_by_class[c] for c in classes]
+    contacted_by_class = Counter(classify_agent(r["user_agent"]) for r in contacted_rows)
+    good_by_class = Counter(classify_agent(r["user_agent"]) for r in good_rows)
+    contacted_vals = [contacted_by_class[c] for c in classes]
     good_vals = [good_by_class[c] for c in classes]
     good_rates = [
-        round(good_by_class[c] / all_by_class[c] * 100, 1) if all_by_class[c] else 0
-        for c in classes
+        percentage(good_by_class[c], contacted_by_class[c]) for c in classes
     ]
-
-    total_known = sum(known_vals)
-    total_good = sum(good_vals)
 
     print(
-        f"\nTotal nodes in DB: {total_known + unknown_known:,} ({unknown_known:,} never contacted)"
+        f"\nAttempted addresses: {len(rows):,} "
+        f"({no_handshake:,} without a successful handshake)"
     )
-    print(f"Known: {total_known:,}, Good: {total_good:,}")
+    print(f"Contacted: {len(contacted_rows):,}, Good: {len(good_rows):,}")
 
-    # Top user agents (good nodes)
-    good_rows = [r for r in rows if r["good"]]
     ua_counter = Counter()
     for r in good_rows:
-        ua = r["user_agent"].strip("/")
-        parts = ua.split("/")
+        parts = r["user_agent"].strip("/").split("/")
         simplified = "/".join(p.split("(")[0].strip() for p in parts if p)
-        ua_counter[simplified] += 1
+        ua_counter[simplified or "(empty)"] += 1
+    top_agents = ua_counter.most_common(20)
 
-    top_agents = ua_counter.most_common(25)
-    top_agent_labels = [a for a, _ in top_agents]
-    top_agent_counts = [c for _, c in top_agents]
-
-    # Knots versions
-    knots_agents = Counter()
-    for r in good_rows:
-        cls = classify_agent(r["user_agent"])
-        if cls == "knots":
-            knots_agents[extract_version(r["user_agent"])] += 1
-
-    top_knots = knots_agents.most_common(15)
-    knots_labels = [a for a, _ in top_knots]
-    knots_counts = [c for _, c in top_knots]
-
-    # Network stats
     networks = ["ipv4", "ipv6", "tor", "i2p"]
     net_labels = ["IPv4", "IPv6", "Tor", "I2P"]
-    known_by_net = Counter()
-    good_by_net = Counter()
-    cross_good = {n: Counter() for n in networks}
-    for r in rows:
-        if not r["user_agent"]:
-            continue
-        net = classify_network(r["address"])
-        cls = classify_agent(r["user_agent"])
-        known_by_net[net] += 1
-        if r["good"]:
-            good_by_net[net] += 1
-            cross_good[net][cls] += 1
-
-    net_known_vals = [known_by_net[n] for n in networks]
+    attempted_by_net = Counter(classify_network(r["address"]) for r in rows)
+    contacted_by_net = Counter(
+        classify_network(r["address"]) for r in contacted_rows
+    )
+    good_by_net = Counter(classify_network(r["address"]) for r in good_rows)
+    net_attempted_vals = [attempted_by_net[n] for n in networks]
+    net_contacted_vals = [contacted_by_net[n] for n in networks]
     net_good_vals = [good_by_net[n] for n in networks]
-    net_good_rates = [
-        round(good_by_net[n] / known_by_net[n] * 100, 1) if known_by_net[n] else 0
-        for n in networks
-    ]
 
-    # Network x Classification (good nodes)
-    net_class_series = []
-    for cls, lbl in zip(classes, labels):
-        net_class_series.append(
+    reference_time = max((r["last_seen"] for r in contacted_rows), default=0)
+    freshness_labels = ["≤ 2 hours", "2–8 hours", "8–24 hours", "1–7 days", "> 7 days"]
+    freshness_counts = [0] * len(freshness_labels)
+    for r in contacted_rows:
+        age = max(0, reference_time - r["last_seen"])
+        if age <= 2 * 60 * 60:
+            bucket = 0
+        elif age <= 8 * 60 * 60:
+            bucket = 1
+        elif age <= 24 * 60 * 60:
+            bucket = 2
+        elif age <= 7 * 24 * 60 * 60:
+            bucket = 3
+        else:
+            bucket = 4
+        freshness_counts[bucket] += 1
+
+    reliability_items = []
+    reliability_labels = {
+        "2h": "2 hours",
+        "8h": "8 hours",
+        "1d": "1 day",
+        "1w": "1 week",
+        "1m": "1 month",
+    }
+    for window in RELIABILITY_WINDOWS:
+        values = [r["reliability"][window] for r in contacted_rows]
+        reliable = sum(value >= 0.9 for value in values)
+        reliability_items.append(
             {
-                "name": lbl,
-                "key": cls,
-                "values": [cross_good[n][cls] for n in networks],
+                "label": reliability_labels[window],
+                "key": window,
+                "median": round(median(values) * 100, 1) if values else 0.0,
+                "high_availability_pct": percentage(reliable, len(values)),
             }
         )
 
-    # IP prefix clustering (IPv4 /24, IPv6 /48)
+    recent_rows = [
+        r
+        for r in contacted_rows
+        if r["blocks"] > 0 and reference_time - r["last_seen"] <= 24 * 60 * 60
+    ]
+    heights_by_hour = {}
+    for r in recent_rows:
+        heights_by_hour.setdefault(r["last_seen"] // (60 * 60), []).append(r["blocks"])
+    reference_by_hour = {}
+    for hour, heights in heights_by_hour.items():
+        heights.sort()
+        if len(heights) < 20:
+            reference_by_hour[hour] = max(heights)
+        else:
+            reference_by_hour[hour] = heights[int((len(heights) - 1) * 0.95)]
+    latest_hour = max(reference_by_hour, default=0)
+    reference_height = reference_by_hour.get(latest_hour, 0)
+    chain_labels = [
+        "Within 2 blocks",
+        "3–6 blocks behind",
+        "7–144 blocks behind",
+        "> 144 blocks behind",
+        "> 2 blocks ahead",
+    ]
+    chain_counts = [0] * len(chain_labels)
+    for r in recent_rows:
+        lag = reference_by_hour[r["last_seen"] // (60 * 60)] - r["blocks"]
+        if lag < -2:
+            bucket = 4
+        elif lag <= 2:
+            bucket = 0
+        elif lag <= 6:
+            bucket = 1
+        elif lag <= 144:
+            bucket = 2
+        else:
+            bucket = 3
+        chain_counts[bucket] += 1
+
+    service_items = []
+    for label, key, flag in SERVICE_FLAGS:
+        count = sum(bool(r["services"] & flag) for r in good_rows)
+        service_items.append(
+            {
+                "label": label,
+                "key": key,
+                "count": count,
+                "pct": percentage(count, len(good_rows)),
+            }
+        )
+
     prefix_by_class = {}
+    prefix_fingerprints = {}
     for r in good_rows:
         prefix = extract_prefix(r["address"])
         if prefix is None:
             continue
-        cls = classify_agent(r["user_agent"])
-        if prefix not in prefix_by_class:
-            prefix_by_class[prefix] = Counter()
-        prefix_by_class[prefix][cls] += 1
-
-    prefix_totals, mean, stddev, sybil_threshold = concentration_stats(prefix_by_class)
-    sybil_prefixes = sorted(
-        p for p, total in prefix_totals.items() if total > sybil_threshold
-    )
-
-    def is_sybil(addr: str) -> bool:
-        prefix = extract_prefix(addr)
-        return prefix is not None and prefix in sybil_prefixes
-
-    sybil_count = sum(1 for r in good_rows if is_sybil(r["address"]))
-    sybil_by_cls = Counter()
-    for r in good_rows:
-        if is_sybil(r["address"]):
-            sybil_by_cls[classify_agent(r["user_agent"])] += 1
-
-    print(f"\nSybil: mean={mean:.1f}, σ={stddev:.1f}, threshold={sybil_threshold:.0f}")
-    print(f"  Flagged {len(sybil_prefixes)} prefixes, {sybil_count:,} nodes")
-
-    # Sybil breakdown (IPv4 + IPv6, excludes Tor)
-    sybil_bars = []
-    for cls, lbl in zip(classes, labels):
-        sybil_n = sybil_by_cls.get(cls, 0)
-        if sybil_n > 0:
-            sybil_bars.append({"label": lbl, "key": cls, "value": sybil_n})
-
-    # Network x Classification with sybil
-    net_class_sybil_series = []
-    for cls, lbl in zip(classes, labels):
-        sybil_in_cls = Counter()
-        for r in good_rows:
-            if classify_agent(r["user_agent"]) == cls and is_sybil(r["address"]):
-                sybil_in_cls[classify_network(r["address"])] += 1
-        organic_vals = [
-            cross_good[n].get(cls, 0) - sybil_in_cls.get(n, 0) for n in networks
-        ]
-        sybil_vals_net = [sybil_in_cls.get(n, 0) for n in networks]
-        net_class_sybil_series.append(
-            {
-                "name": lbl,
-                "key": cls,
-                "values": organic_vals,
-            }
+        prefix_by_class.setdefault(prefix, Counter())[classify_agent(r["user_agent"])] += 1
+        fingerprint = (
+            r["user_agent"],
+            r["services"],
+            r["protocol_version"],
         )
-        if any(v > 0 for v in sybil_vals_net):
-            net_class_sybil_series.append(
-                {
-                    "name": f"{lbl} (sybil)",
-                    "key": f"{cls}_sybil",
-                    "values": sybil_vals_net,
-                }
-            )
-
-    # Top /16 prefixes
+        prefix_fingerprints.setdefault(prefix, Counter())[fingerprint] += 1
+    prefix_totals = {
+        prefix: sum(counts.values()) for prefix, counts in prefix_by_class.items()
+    }
     top_prefixes = sorted(prefix_totals, key=prefix_totals.get, reverse=True)[:20]
-    top_prefix_owner_items = []
+
+    prefix_table = []
     for prefix in top_prefixes:
         asn = lookup_asn_for_prefix(prefix, asmap)
         info = asn_info(asn)
-        top_prefix_owner_items.append(
-            {
-                "asn": asn,
-                "name": info["name"],
-                "category": info["category"],
-                "tooltip": info["tooltip"],
-            }
-        )
-    top_prefix_series = []
-    for cls, lbl in zip(classes, labels):
-        top_prefix_series.append(
-            {
-                "name": lbl,
-                "key": cls,
-                "values": [prefix_by_class[p].get(cls, 0) for p in top_prefixes],
-            }
-        )
-
-    # Prefix table
-    prefix_table = []
-    for idx, p in enumerate(top_prefixes):
+        fingerprints = prefix_fingerprints[prefix]
         prefix_table.append(
             {
-                "prefix": p,
-                "asn": top_prefix_owner_items[idx]["asn"],
-                "asn_name": top_prefix_owner_items[idx]["name"],
-                "asn_category": top_prefix_owner_items[idx]["category"],
-                "asn_tooltip": top_prefix_owner_items[idx]["tooltip"],
-                "total": prefix_totals[p],
-                "core": prefix_by_class[p].get("core", 0),
-                "knots": prefix_by_class[p].get("knots", 0),
-                "other": prefix_by_class[p].get("other", 0),
-            }
-        )
-
-    # Per-class sybil concentration stats
-    sybil_by_class_pct = {}
-    for cls in classes:
-        total = sum(c.get(cls, 0) for c in prefix_by_class.values())
-        in_sybil = sum(prefix_by_class[p].get(cls, 0) for p in sybil_prefixes)
-        sybil_by_class_pct[cls] = {
-            "total": total,
-            "sybil": in_sybil,
-            "pct": round(in_sybil / total * 100, 1) if total else 0,
-        }
-
-    # ASN clustering
-    asn_by_class = {}
-    for r in good_rows:
-        asn = lookup_asn(r["address"], asmap)
-        if asn is None:
-            continue
-        cls = classify_agent(r["user_agent"])
-        if asn not in asn_by_class:
-            asn_by_class[asn] = Counter()
-        asn_by_class[asn][cls] += 1
-
-    asn_totals, asn_mean, asn_stddev, asn_threshold = concentration_stats(asn_by_class)
-    sybil_asns = sorted(
-        asn for asn, total in asn_totals.items() if total > asn_threshold
-    )
-    sybil_asn_items = []
-    for asn in sybil_asns:
-        info = asn_info(asn)
-        sybil_asn_items.append(
-            {
+                "prefix": prefix,
                 "asn": asn,
-                "name": info["name"],
-                "category": info["category"],
-                "tooltip": info["tooltip"],
+                "asn_name": info["name"],
+                "asn_category": info["category"],
+                "asn_tooltip": info["tooltip"],
+                "total": prefix_totals[prefix],
+                "core": prefix_by_class[prefix].get("core", 0),
+                "other": prefix_by_class[prefix].get("other", 0),
+                "distinct_fingerprints": len(fingerprints),
+                "dominant_fingerprint_share": percentage(
+                    max(fingerprints.values()), prefix_totals[prefix]
+                ),
             }
         )
 
-    asn_sybil_count = 0
-    asn_sybil_by_cls = Counter()
+    asn_by_class = {}
+    asn_prefixes = {}
     for r in good_rows:
         asn = lookup_asn(r["address"], asmap)
-        if asn in sybil_asns:
-            asn_sybil_count += 1
-            asn_sybil_by_cls[classify_agent(r["user_agent"])] += 1
-
-    print(
-        f"\nASN concentration: mean={asn_mean:.1f}, σ={asn_stddev:.1f}, threshold={asn_threshold:.0f}"
-    )
-    print(f"  Flagged {len(sybil_asns)} ASNs, {asn_sybil_count:,} nodes")
-
-    asn_bars = []
-    asn_good_by_cls = Counter()
-    for counts_by_cls in asn_by_class.values():
-        for cls, n in counts_by_cls.items():
-            asn_good_by_cls[cls] += n
-
-    for cls, lbl in zip(classes, labels):
-        organic = asn_good_by_cls.get(cls, 0) - asn_sybil_by_cls.get(cls, 0)
-        sybil_n = asn_sybil_by_cls.get(cls, 0)
-        asn_bars.append({"label": lbl, "key": cls, "value": organic})
-        if sybil_n > 0:
-            asn_bars.append(
-                {
-                    "label": f"{lbl} (high concentration AS)",
-                    "key": f"{cls}_sybil",
-                    "value": sybil_n,
-                }
-            )
-
+        prefix = extract_prefix(r["address"])
+        if asn is None or prefix is None:
+            continue
+        asn_by_class.setdefault(asn, Counter())[classify_agent(r["user_agent"])] += 1
+        asn_prefixes.setdefault(asn, Counter())[prefix] += 1
+    asn_totals = {
+        asn: sum(counts.values()) for asn, counts in asn_by_class.items()
+    }
     top_asns = sorted(asn_totals, key=asn_totals.get, reverse=True)[:20]
-    top_asn_series = []
-    for cls, lbl in zip(classes, labels):
-        top_asn_series.append(
-            {
-                "name": lbl,
-                "key": cls,
-                "values": [asn_by_class[asn].get(cls, 0) for asn in top_asns],
-            }
-        )
-    top_asn_infos = [asn_info(asn) for asn in top_asns]
-    top_asn_names = [info["name"] for info in top_asn_infos]
-    top_asn_categories = [info["category"] for info in top_asn_infos]
-    top_asn_tooltips = [info["tooltip"] for info in top_asn_infos]
 
     asn_table = []
     for asn in top_asns:
         info = asn_info(asn)
+        prefix_counts = asn_prefixes[asn]
         asn_table.append(
             {
                 "asn": asn,
@@ -584,20 +475,13 @@ def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> 
                 "tooltip": info["tooltip"],
                 "total": asn_totals[asn],
                 "core": asn_by_class[asn].get("core", 0),
-                "knots": asn_by_class[asn].get("knots", 0),
                 "other": asn_by_class[asn].get("other", 0),
+                "distinct_prefixes": len(prefix_counts),
+                "largest_prefix_share": percentage(
+                    max(prefix_counts.values()), asn_totals[asn]
+                ),
             }
         )
-
-    asn_sybil_by_class_pct = {}
-    for cls in classes:
-        total = sum(c.get(cls, 0) for c in asn_by_class.values())
-        in_sybil = sum(asn_by_class[asn].get(cls, 0) for asn in sybil_asns)
-        asn_sybil_by_class_pct[cls] = {
-            "total": total,
-            "sybil": in_sybil,
-            "pct": round(in_sybil / total * 100, 1) if total else 0,
-        }
 
     category_labels = {
         "business": "Business",
@@ -609,102 +493,91 @@ def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> 
     }
     asn_by_category = Counter()
     for asn, total in asn_totals.items():
-        category = asn_info(asn)["category"] or "unknown"
-        asn_by_category[category] += total
+        asn_by_category[asn_info(asn)["category"] or "unknown"] += total
     asn_category_items = sorted(
         asn_by_category.items(), key=lambda item: item[1], reverse=True
     )
 
-    # Overview pie
-    overview_labels = ["No user agent", *labels]
-    overview_values = [unknown_known, *known_vals]
-    overview_keys = ["unknown", *classes]
+    mapped_good = sum(asn_totals.values())
+    hosting_good = asn_by_category.get("hosting", 0)
+    top_five_good = sum(sorted(asn_totals.values(), reverse=True)[:5])
 
-    # Custom user agents
     custom_ua = Counter()
-    for r in rows:
-        cls = classify_agent(r["user_agent"])
-        if cls == "other":
+    for r in contacted_rows:
+        if r["user_agent"] and classify_agent(r["user_agent"]) == "other":
             custom_ua[r["user_agent"]] += 1
     custom_filtered = [
-        {"ua": ua, "count": c} for ua, c in custom_ua.most_common() if c > 1
+        {"ua": ua, "count": count}
+        for ua, count in custom_ua.most_common()
+        if count > 1
     ]
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "totals": {
-            "total_db": total_known + unknown_known,
-            "unknown": unknown_known,
-            "known": total_known,
-            "good": total_good,
+        "summary": {
+            "attempted": len(rows),
+            "contacted": len(contacted_rows),
+            "good": len(good_rows),
+            "no_handshake": no_handshake,
         },
         "classification": {
             "labels": labels,
             "keys": classes,
-            "known": known_vals,
+            "contacted": contacted_vals,
             "good": good_vals,
             "good_rates": good_rates,
         },
         "top_user_agents": {
-            "labels": top_agent_labels,
-            "counts": top_agent_counts,
-        },
-        "knots_versions": {
-            "labels": knots_labels,
-            "counts": knots_counts,
+            "labels": [agent for agent, _ in top_agents],
+            "counts": [count for _, count in top_agents],
         },
         "networks": {
             "labels": net_labels,
             "keys": networks,
-            "known": net_known_vals,
+            "attempted": net_attempted_vals,
+            "contacted": net_contacted_vals,
             "good": net_good_vals,
-            "good_rates": net_good_rates,
+            "contact_rates": [
+                percentage(contacted_by_net[n], attempted_by_net[n]) for n in networks
+            ],
+            "good_rates": [
+                percentage(good_by_net[n], contacted_by_net[n]) for n in networks
+            ],
         },
-        "network_classification": {
-            "net_labels": net_labels,
-            "series": net_class_series,
+        "freshness": {
+            "reference_time": reference_time,
+            "scope_count": len(contacted_rows),
+            "labels": freshness_labels,
+            "counts": freshness_counts,
         },
-        "sybil": {
-            "mean": round(mean, 1),
-            "stddev": round(stddev, 1),
-            "threshold": round(sybil_threshold),
-            "prefixes": sybil_prefixes,
-            "count": sybil_count,
-            "bars": sybil_bars,
+        "reliability": {
+            "scope_count": len(contacted_rows),
+            "items": reliability_items,
         },
-        "asn_sybil": {
-            "mean": round(asn_mean, 1),
-            "stddev": round(asn_stddev, 1),
-            "threshold": round(asn_threshold),
-            "asns": sybil_asns,
-            "items": sybil_asn_items,
-            "count": asn_sybil_count,
-            "bars": asn_bars,
+        "chain_health": {
+            "reference_height": reference_height,
+            "scope_count": len(recent_rows),
+            "labels": chain_labels,
+            "counts": chain_counts,
         },
-        "network_classification_sybil": {
-            "net_labels": net_labels,
-            "series": net_class_sybil_series,
+        "service_flags": {
+            "scope_count": len(good_rows),
+            "items": service_items,
         },
-        "top_prefixes": {
-            "labels": top_prefixes,
-            "owners": top_prefix_owner_items,
-            "series": top_prefix_series,
+        "infrastructure": {
+            "routable_good": sum(prefix_totals.values()),
+            "mapped_good": mapped_good,
+            "distinct_prefixes": len(prefix_totals),
+            "distinct_asns": len(asn_totals),
+            "top_five_asn_pct": percentage(top_five_good, mapped_good),
+            "hosting_pct": percentage(hosting_good, mapped_good),
         },
         "prefix_table": {
             "rows": prefix_table,
             "stats": {
-                "distinct_prefixes": len(prefix_by_class),
+                "distinct_prefixes": len(prefix_totals),
                 "total_good_routable": sum(prefix_totals.values()),
-                "sybil_prefix_count": len(sybil_prefixes),
-                "sybil_by_class": sybil_by_class_pct,
             },
-        },
-        "top_asns": {
-            "labels": top_asns,
-            "names": top_asn_names,
-            "categories": top_asn_categories,
-            "tooltips": top_asn_tooltips,
-            "series": top_asn_series,
         },
         "asn_categories": {
             "labels": [
@@ -717,16 +590,9 @@ def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> 
         "asn_table": {
             "rows": asn_table,
             "stats": {
-                "mapped_asns": len(asn_by_class),
-                "total_good_routable_mapped": sum(asn_totals.values()),
-                "sybil_asn_count": len(sybil_asns),
-                "sybil_by_class": asn_sybil_by_class_pct,
+                "mapped_asns": len(asn_totals),
+                "total_good_routable_mapped": mapped_good,
             },
-        },
-        "overview_pie": {
-            "labels": overview_labels,
-            "values": overview_values,
-            "keys": overview_keys,
         },
         "custom_user_agents": {
             "items": custom_filtered,

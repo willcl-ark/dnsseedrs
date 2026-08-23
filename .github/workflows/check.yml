@@ -9,6 +9,12 @@ concurrency:
   cancel-in-progress: true
 name: check
 jobs:
+  analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test seed analysis
+        run: python3 -m unittest test_analyze_seeds.py
   build:
     runs-on: ubuntu-latest
     name: format

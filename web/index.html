@@ -3,466 +3,450 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Bitcoin DNS Seeder Analysis</title>
+<title>Bitcoin DNS Seeder Network Snapshot</title>
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="style.css">
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 </head>
-<body class="bg-od-bg text-od-fg min-h-screen">
-
-<div class="max-w-7xl mx-auto px-4 py-8">
-  <h1 class="text-3xl font-bold text-center text-od-blue">Bitcoin DNS Seeder Analysis</h1>
-  <p class="text-center text-od-grey mt-1">
-    Data from <a href="https://bitcoin.fish.foo/" class="text-od-cyan hover:underline">bitcoin.fish.foo</a>
-    &mdash; <span id="generated-at"></span>
-  </p>
-
-  <div id="loading" class="text-center py-20 text-od-grey">Loading data&hellip;</div>
-  <div id="content" class="hidden space-y-8 mt-8">
-
-    <section id="classification" class="bg-od-bg1 rounded-lg p-6">
-      <h2 class="text-lg font-semibold mb-4"><a href="#classification" class="text-od-fg hover:text-od-blue">Known &amp; Good Nodes by Classification</a></h2>
-      <p class="text-od-grey text-sm mb-3">No sybil delineation applied.</p>
-      <canvas id="chart-classification"></canvas>
-    </section>
-
-    <section id="distribution" class="bg-od-bg1 rounded-lg p-6">
-      <h2 class="text-lg font-semibold mb-4"><a href="#distribution" class="text-od-fg hover:text-od-blue">Node Distribution</a></h2>
-      <p class="text-od-grey text-sm mb-3">No sybil delineation applied.</p>
-      <div class="grid grid-cols-2 gap-4">
-        <div><p class="text-center text-sm text-od-lgrey mb-2">Known Nodes</p><canvas id="chart-pie-known"></canvas></div>
-        <div><p class="text-center text-sm text-od-lgrey mb-2">Good Nodes</p><canvas id="chart-pie-good"></canvas></div>
-      </div>
-    </section>
-
-    <section id="top-ua" class="bg-od-bg1 rounded-lg p-6">
-      <h2 class="text-lg font-semibold mb-4"><a href="#top-ua" class="text-od-fg hover:text-od-blue">Top 25 User Agents (Good Nodes)</a></h2>
-      <p class="text-od-grey text-sm mb-3">No sybil delineation applied.</p>
-      <div style="height: 600px"><canvas id="chart-top-ua"></canvas></div>
-    </section>
-
-    <section id="good-rate" class="bg-od-bg1 rounded-lg p-6">
-      <h2 class="text-lg font-semibold mb-4"><a href="#good-rate" class="text-od-fg hover:text-od-blue">Good Rate by Classification</a></h2>
-      <p class="text-od-grey text-sm mb-3">No sybil delineation applied.</p>
-      <canvas id="chart-good-rate"></canvas>
-    </section>
-
-    <section id="kb-versions" class="bg-od-bg1 rounded-lg p-6">
-      <h2 class="text-lg font-semibold mb-4"><a href="#kb-versions" class="text-od-fg hover:text-od-blue">Knots Version Distribution (Good)</a></h2>
-      <p class="text-od-grey text-sm mb-3">No sybil delineation applied.</p>
-      <div style="height: 450px"><canvas id="chart-kb-versions"></canvas></div>
-    </section>
-
-    <section id="networks" class="bg-od-bg1 rounded-lg p-6">
-      <h2 class="text-lg font-semibold mb-4"><a href="#networks" class="text-od-fg hover:text-od-blue">Known &amp; Good Nodes by Network</a></h2>
-      <p class="text-od-grey text-sm mb-3">No sybil delineation applied.</p>
-      <canvas id="chart-networks"></canvas>
-    </section>
-
-    <section id="net-good-rate" class="bg-od-bg1 rounded-lg p-6">
-      <h2 class="text-lg font-semibold mb-4"><a href="#net-good-rate" class="text-od-fg hover:text-od-blue">Good Rate by Network</a></h2>
-      <p class="text-od-grey text-sm mb-3">No sybil delineation applied.</p>
-      <canvas id="chart-net-good-rate"></canvas>
-    </section>
-
-    <section id="net-class" class="bg-od-bg1 rounded-lg p-6">
-      <h2 class="text-lg font-semibold mb-4"><a href="#net-class" class="text-od-fg hover:text-od-blue">Good Nodes: Network &times; Classification</a></h2>
-      <p class="text-od-grey text-sm mb-3">No sybil delineation applied.</p>
-      <canvas id="chart-net-class"></canvas>
-    </section>
-
-    <section id="sybil" class="bg-od-bg1 rounded-lg p-6">
-      <h2 class="text-lg font-semibold mb-4"><a href="#sybil" class="text-od-fg hover:text-od-blue">Probable Sybil Detection (IPv4 &amp; IPv6 only)</a></h2>
-      <p class="text-od-lgrey mb-2">
-        Likely sybil nodes detected by grouping good IPv4 (/24) and IPv6 (/48) nodes by prefix and flagging any
-        prefix where node count exceeds <strong class="text-od-fg">mean + 5&sigma;</strong>
-        (<span id="sybil-stats"></span>). Tor and I2P nodes are excluded as they have no routable prefix.
-      </p>
-      <p class="text-od-lgrey mb-4">
-        Flagged <strong class="text-od-fg" id="sybil-prefix-count"></strong> prefixes containing
-        <strong class="text-od-fg" id="sybil-node-count"></strong> nodes:
-        <span id="sybil-prefix-list" class="text-od-grey"></span>
-      </p>
-      <canvas id="chart-sybil"></canvas>
-    </section>
-
-    <section id="asn-concentration" class="bg-od-bg1 rounded-lg p-6">
-      <h2 class="text-lg font-semibold mb-4"><a href="#asn-concentration" class="text-od-fg hover:text-od-blue">High-Concentration ASNs</a></h2>
-      <p class="text-od-lgrey mb-2">
-        Good routable nodes grouped by autonomous system, flagging any
-        ASN where node count exceeds <strong class="text-od-fg">mean + 5&sigma;</strong>
-        (<span id="asn-concentration-stats"></span>). Tor and I2P nodes are excluded as they have no routable IP.
-      </p>
-      <p class="text-od-lgrey mb-4">
-        Flagged <strong class="text-od-fg" id="asn-concentration-count"></strong> ASNs containing
-        <strong class="text-od-fg" id="asn-concentration-node-count"></strong> nodes:
-        <span id="asn-concentration-list" class="text-od-grey"></span>
-      </p>
-      <canvas id="chart-asn-concentration"></canvas>
-    </section>
-
-    <section id="net-class-sybil" class="bg-od-bg1 rounded-lg p-6">
-      <h2 class="text-lg font-semibold mb-4"><a href="#net-class-sybil" class="text-od-fg hover:text-od-blue">Good Nodes: Network &times; Classification (Sybil Filtered)</a></h2>
-      <p class="text-od-grey text-sm mb-3">Probable sybil nodes separated out. Tor and I2P nodes shown as-is (no prefix-based sybil detection).</p>
-      <canvas id="chart-net-class-sybil"></canvas>
-    </section>
-
-    <section id="top-prefixes" class="bg-od-bg1 rounded-lg p-6">
-      <h2 class="text-lg font-semibold mb-4"><a href="#top-prefixes" class="text-od-fg hover:text-od-blue">Top 20 Prefixes by Good Node Count</a></h2>
-      <p class="text-od-grey text-sm mb-3">IPv4 /24 and IPv6 /48 prefixes. Excludes Tor and I2P.</p>
-      <div style="height: 550px"><canvas id="chart-top-prefixes"></canvas></div>
-    </section>
-
-    <section id="top-asns" class="bg-od-bg1 rounded-lg p-6">
-      <h2 class="text-lg font-semibold mb-4"><a href="#top-asns" class="text-od-fg hover:text-od-blue">Top 20 ASNs by Good Node Count</a></h2>
-      <p class="text-od-grey text-sm mb-3">Routable good IPv4 and IPv6 nodes mapped through <a href="https://github.com/bitcoin-core/asmap-data" class="text-od-cyan hover:underline"><code>latest_asmap.decoded</code></a>. Excludes Tor and I2P.</p>
-      <div style="height: 550px"><canvas id="chart-top-asns"></canvas></div>
-    </section>
-
-    <section id="asn-categories" class="bg-od-bg1 rounded-lg p-6">
-      <h2 class="text-lg font-semibold mb-4"><a href="#asn-categories" class="text-od-fg hover:text-od-blue">ASN Categories (Good Nodes)</a></h2>
-      <p class="text-od-grey text-sm mb-3">Routable good IPv4 and IPv6 nodes grouped by the mapped ASN metadata category. Excludes Tor and I2P.</p>
-      <div class="max-w-md mx-auto"><canvas id="chart-asn-categories"></canvas></div>
-    </section>
-
-    <section id="prefix-table" class="bg-od-bg1 rounded-lg p-6">
-      <h2 class="text-lg font-semibold mb-4"><a href="#prefix-table" class="text-od-fg hover:text-od-blue">IP Prefix Concentration (Good Nodes)</a></h2>
-      <p class="text-od-grey text-sm mb-3" id="prefix-stats"></p>
-      <div class="overflow-x-auto">
-        <table class="w-full text-sm">
-          <thead><tr class="text-od-cyan border-b border-od-bg2">
-            <th class="text-left py-2 px-3">Prefix</th>
-            <th class="text-left py-2 px-3">AS Owner</th>
-            <th class="text-right py-2 px-3">Total</th>
-            <th class="text-right py-2 px-3">Core</th>
-            <th class="text-right py-2 px-3">Knots</th>
-            <th class="text-right py-2 px-3">Other</th>
-          </tr></thead>
-          <tbody id="prefix-table-body"></tbody>
-        </table>
-      </div>
-    </section>
-
-    <section id="asn-table" class="bg-od-bg1 rounded-lg p-6">
-      <h2 class="text-lg font-semibold mb-4"><a href="#asn-table" class="text-od-fg hover:text-od-blue">ASN Concentration (Good Nodes)</a></h2>
-      <p class="text-od-grey text-sm mb-3" id="asn-stats"></p>
-      <div class="overflow-x-auto">
-        <table class="w-full text-sm">
-          <thead><tr class="text-od-cyan border-b border-od-bg2">
-            <th class="text-left py-2 px-3">ASN</th>
-            <th class="text-right py-2 px-3">Total</th>
-            <th class="text-right py-2 px-3">Core</th>
-            <th class="text-right py-2 px-3">Knots</th>
-            <th class="text-right py-2 px-3">Other</th>
-          </tr></thead>
-          <tbody id="asn-table-body"></tbody>
-        </table>
-      </div>
-    </section>
-
-    <section id="overview" class="bg-od-bg1 rounded-lg p-6">
-      <h2 class="text-lg font-semibold mb-4"><a href="#overview" class="text-od-fg hover:text-od-blue">All Nodes in Database (Including Never Contacted)</a></h2>
-      <div class="max-w-md mx-auto"><canvas id="chart-overview"></canvas></div>
-    </section>
-
-    <section id="custom-ua" class="bg-od-bg1 rounded-lg p-6">
-      <h2 class="text-lg font-semibold mb-4"><a href="#custom-ua" class="text-od-fg hover:text-od-blue">Custom User Agents (count &gt; 1)</a></h2>
-      <p class="text-od-grey text-sm mb-3" id="custom-ua-stats"></p>
-      <div class="overflow-x-auto">
-        <table class="w-full text-sm">
-          <thead><tr class="text-od-cyan border-b border-od-bg2">
-            <th class="text-left py-2 px-3">User Agent</th>
-            <th class="text-right py-2 px-3">Count</th>
-          </tr></thead>
-          <tbody id="custom-ua-body"></tbody>
-        </table>
-      </div>
-    </section>
-
+<body>
+<header class="site-header">
+  <div>
+    <p class="eyebrow">DNS seed crawl analysis</p>
+    <h1>Bitcoin Network Snapshot</h1>
+    <p class="lede">
+      View of attempted addresses, successful handshakes, seeder-eligible
+      nodes, client families, and routable network concentration.
+    </p>
   </div>
-</div>
+  <nav class="source-links" aria-label="Sources">
+    <a href="https://bitcoin.fish.foo/seeds.txt.gz">Seed data</a>
+    <a href="https://github.com/bitcoin-core/asmap-data">ASMap data</a>
+    <a href="https://github.com/willcl-ark/dnsseedrs">Repository</a>
+  </nav>
+</header>
+
+<main>
+  <section class="method-note" aria-labelledby="method-title">
+    <h2 id="method-title">Method</h2>
+    <p>
+      Attempted addresses are rows present in the dump; the dump excludes untried
+      database rows. Contacted means a successful version handshake has been
+      recorded. Good means eligible for seeding. No handshake means attempts have
+      not completed a version handshake; it does not mean untried. User agents with
+      a <code>Satoshi:</code> product token are classified as Bitcoin Core; all other
+      reported user agents are grouped as Other.
+    </p>
+    <p id="generated-at" class="generated-at"></p>
+  </section>
+
+  <div id="loading" class="status" role="status" aria-live="polite">Loading data...</div>
+  <div id="error" class="status error" role="alert" hidden></div>
+
+  <div id="content" hidden>
+    <section aria-labelledby="summary-title">
+      <h2 id="summary-title">Crawl Summary</h2>
+      <div id="summary-cards" class="summary-grid"></div>
+    </section>
+
+    <section class="band" aria-labelledby="health-title">
+      <div class="section-heading">
+        <div>
+          <h2 id="health-title">Network Health</h2>
+          <p>Reachability and seeder eligibility split by transport network and client family.</p>
+        </div>
+      </div>
+      <div class="two-column">
+        <div>
+          <h3>Transport networks</h3>
+          <div class="table-wrap">
+            <table class="network-table">
+              <caption>Attempted, contacted, and good nodes by transport network</caption>
+              <thead>
+                <tr>
+                  <th>Network</th>
+                  <th class="num">Attempted</th>
+                  <th class="num">Contacted</th>
+                  <th class="num">Good</th>
+                  <th class="num">Contact rate</th>
+                  <th class="num">Good rate</th>
+                </tr>
+              </thead>
+              <tbody id="network-table"></tbody>
+            </table>
+          </div>
+        </div>
+        <div>
+          <h3>Client families</h3>
+          <div id="classification-bars" class="bar-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="band" aria-labelledby="quality-title">
+      <div class="section-heading">
+        <div>
+          <h2 id="quality-title">Node Quality</h2>
+          <p>Freshness, reliability, chain state, and advertised capabilities for contacted or good nodes.</p>
+        </div>
+      </div>
+      <div class="four-column">
+        <article>
+          <h3>Freshness</h3>
+          <p id="freshness-note" class="note"></p>
+          <div id="freshness-bars" class="bar-list"></div>
+        </article>
+        <article>
+          <h3>Reliability</h3>
+          <p id="reliability-note" class="note"></p>
+          <div id="reliability-bars" class="bar-list"></div>
+        </article>
+        <article>
+          <h3>Chain health</h3>
+          <p id="chain-note" class="note"></p>
+          <div id="chain-bars" class="bar-list"></div>
+        </article>
+        <article>
+          <h3>Advertised services</h3>
+          <p id="service-note" class="note"></p>
+          <div id="service-bars" class="bar-list"></div>
+        </article>
+      </div>
+    </section>
+
+    <section class="band" aria-labelledby="clients-title">
+      <div class="section-heading">
+        <div>
+          <h2 id="clients-title">Clients</h2>
+          <p>Bitcoin Core versus Other, top reported user agents, and custom user-agent detail.</p>
+        </div>
+      </div>
+      <div class="two-column">
+        <div>
+          <h3>Good nodes by user agent</h3>
+          <div id="top-ua-bars" class="bar-list dense"></div>
+        </div>
+        <div>
+          <h3>Custom user agents</h3>
+          <p id="custom-ua-stats" class="note"></p>
+          <div class="table-wrap">
+            <table class="compact-table">
+              <caption>Reported non-standard user agents</caption>
+              <thead>
+                <tr>
+                  <th>User agent</th>
+                  <th class="num">Count</th>
+                </tr>
+              </thead>
+              <tbody id="custom-ua-table"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="band" aria-labelledby="infra-title">
+      <div class="section-heading">
+        <div>
+          <h2 id="infra-title">Infrastructure</h2>
+          <p>Routable good nodes grouped by ASMap ASN and IP prefix. These are concentration indicators, not unique users or machines.</p>
+        </div>
+      </div>
+      <div id="infra-cards" class="summary-grid compact"></div>
+      <div class="infra-block">
+        <h3>ASN categories</h3>
+        <div id="asn-category-bars" class="bar-list"></div>
+      </div>
+      <div class="infra-block">
+        <h3>Top ASNs</h3>
+        <p id="asn-stats" class="note"></p>
+        <div class="table-wrap">
+          <table class="asn-data-table">
+            <caption>Largest autonomous systems by good routable node count</caption>
+            <thead>
+              <tr>
+                <th>ASN</th>
+                <th>Owner</th>
+                <th>Category</th>
+                <th class="num">Total</th>
+                <th class="num">Core</th>
+                <th class="num">Other</th>
+                <th class="num">Prefixes</th>
+                <th class="num">Largest prefix</th>
+              </tr>
+            </thead>
+            <tbody id="asn-table"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="infra-block">
+        <h3>Top prefixes</h3>
+        <p id="prefix-stats" class="note"></p>
+        <div class="table-wrap">
+          <table class="prefix-data-table">
+            <caption>Largest IPv4 /24 and IPv6 /48 prefixes by good routable node count</caption>
+            <thead>
+              <tr>
+                <th>Prefix</th>
+                <th>ASN</th>
+                <th>Owner</th>
+                <th>Category</th>
+                <th class="num">Total</th>
+                <th class="num">Core</th>
+                <th class="num">Other</th>
+                <th class="num">Fingerprints</th>
+                <th class="num">Dominant fingerprint</th>
+              </tr>
+            </thead>
+            <tbody id="prefix-table"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </div>
+</main>
 
 <script>
-Chart.defaults.color = '#a0a8b7';
-Chart.defaults.font.family = 'ui-monospace, monospace';
+const $ = (id) => document.getElementById(id);
+const number = new Intl.NumberFormat(undefined);
+const percent = new Intl.NumberFormat(undefined, {
+  maximumFractionDigits: 1,
+  minimumFractionDigits: 1,
+});
 
-const GRID = '#30363f';
-
-const C = {
-  core:         '#cc9057',
-  knots:        '#4fa6ed',
-  other:        '#535965',
-  unknown:      '#323641',
-  known:        '#e2b86b',
-  good:         '#8ebd6b',
-  ipv4:         '#48b0bd',
-  ipv6:         '#e2b86b',
-  tor:          '#bf68d9',
-  i2p:          '#cc9057',
-  // sybil variants — visually distinct from parent
-  core_sybil:   '#266269',
-  knots_sybil:  '#835d1a',
-  other_sybil:  '#323641',
-  business:     '#8ebd6b',
-  education_research: '#4fa6ed',
-  government_admin:   '#e2b86b',
-  hosting:      '#e55561',
-  isp:          '#48b0bd',
-};
-
-function col(key) { return C[key] || '#535965'; }
-function colKeys(keys) { return keys.map(col); }
-
-function colorForUa(label) {
-  const ll = label.toLowerCase();
-  if (ll.includes('knots')) return C.knots;
-  if (label.startsWith('Satoshi:') && !label.includes('/')) return C.core;
-  return C.other;
+function fmt(value) {
+  return number.format(value || 0);
 }
 
-function barChart(id, labels, datasets, opts = {}) {
-  return new Chart(document.getElementById(id), {
-    type: 'bar',
-    data: { labels, datasets },
-    options: {
-      responsive: true,
-      maintainAspectRatio: opts.maintainAspectRatio !== false,
-      indexAxis: opts.horizontal ? 'y' : 'x',
-      scales: {
-        x: { stacked: opts.stacked, grid: { color: GRID }, max: opts.maxX },
-        y: { stacked: opts.stacked, grid: { color: GRID }, max: opts.maxY },
-      },
-      plugins: {
-        legend: { display: datasets.length > 1 },
-        tooltip: { callbacks: opts.tooltipCallbacks || {} },
-      },
-    },
-  });
+function pct(value) {
+  if (value == null || Number.isNaN(Number(value))) return "n/a";
+  return `${percent.format(Number(value))}%`;
 }
 
-function pieChart(id, labels, values, colors) {
-  return new Chart(document.getElementById(id), {
-    type: 'doughnut',
-    data: {
-      labels,
-      datasets: [{ data: values, backgroundColor: colors, borderWidth: 0 }],
-    },
-    options: {
-      responsive: true,
-      plugins: {
-        legend: { position: 'bottom' },
-        tooltip: {
-          callbacks: {
-            label(ctx) {
-              const total = ctx.dataset.data.reduce((sum, value) => sum + value, 0);
-              const pct = total ? (ctx.parsed / total * 100).toFixed(1) : '0.0';
-              return `${ctx.label}: ${fmt(ctx.parsed)} (${pct}%)`;
-            },
-          },
-        },
-      },
-    },
-  });
+function text(value, fallback = "Unknown") {
+  if (value == null || value === "") return fallback;
+  return String(value);
 }
 
-function fmt(n) { return n.toLocaleString(); }
-
-function escapeHtml(s) {
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
-}
-
-async function main() {
-  const resp = await fetch('data.json').catch(e => {
-    document.getElementById('loading').textContent = 'Failed to load data.json: ' + e.message;
-    throw e;
-  });
-  if (!resp.ok) {
-    document.getElementById('loading').textContent = 'Failed to load data.json: ' + resp.status;
-    return;
+function requireObject(data, key) {
+  const value = data[key];
+  if (!value || typeof value !== "object") {
+    throw new Error(`data.json is missing ${key}`);
   }
-  const D = await resp.json();
-
-  document.getElementById('generated-at').textContent =
-    new Date(D.generated_at).toLocaleString();
-  document.getElementById('loading').classList.add('hidden');
-  document.getElementById('content').classList.remove('hidden');
-
-  const c = D.classification;
-  const classColors = colKeys(c.keys);
-
-  // Classification bar
-  barChart('chart-classification', c.labels, [
-    { label: 'Known', data: c.known, backgroundColor: C.known },
-    { label: 'Good', data: c.good, backgroundColor: C.good },
-  ]);
-
-  // Pies
-  pieChart('chart-pie-known', c.labels, c.known, classColors);
-  pieChart('chart-pie-good', c.labels, c.good, classColors);
-
-  // Top user agents
-  const ua = D.top_user_agents;
-  barChart('chart-top-ua', ua.labels, [{
-    data: ua.counts,
-    backgroundColor: ua.labels.map(colorForUa),
-  }], { horizontal: true, maintainAspectRatio: false });
-
-  // Good rate
-  barChart('chart-good-rate', c.labels, [{
-    data: c.good_rates, backgroundColor: classColors,
-  }], { maxY: 100 });
-
-  // Knots versions
-  const kb = D.knots_versions;
-  barChart('chart-kb-versions', kb.labels, [{
-    data: kb.counts,
-    backgroundColor: kb.labels.map(colorForUa),
-  }], { horizontal: true, maintainAspectRatio: false });
-
-  // Networks
-  const n = D.networks;
-  barChart('chart-networks', n.labels, [
-    { label: 'Known', data: n.known, backgroundColor: C.known },
-    { label: 'Good', data: n.good, backgroundColor: C.good },
-  ]);
-
-  // Network good rate
-  barChart('chart-net-good-rate', n.labels, [{
-    data: n.good_rates, backgroundColor: colKeys(n.keys),
-  }], { maxY: 100 });
-
-  // Network x Classification
-  const nc = D.network_classification;
-  barChart('chart-net-class', nc.net_labels,
-    nc.series.map(s => ({ label: s.name, data: s.values, backgroundColor: col(s.key) })),
-    { stacked: true });
-
-  // Sybil
-  const sy = D.sybil;
-  document.getElementById('sybil-stats').textContent =
-    `mean=${sy.mean}, σ=${sy.stddev}, threshold=${sy.threshold}`;
-  document.getElementById('sybil-prefix-count').textContent = sy.prefixes.length;
-  document.getElementById('sybil-node-count').textContent = fmt(sy.count);
-  document.getElementById('sybil-prefix-list').textContent = sy.prefixes.join(', ');
-
-  barChart('chart-sybil', sy.bars.map(b => b.label), [{
-    data: sy.bars.map(b => b.value),
-    backgroundColor: sy.bars.map(b => col(b.key)),
-  }]);
-
-  // ASN concentration
-  const asy = D.asn_sybil;
-  document.getElementById('asn-concentration-stats').textContent =
-    `mean=${asy.mean}, σ=${asy.stddev}, threshold=${asy.threshold}`;
-  document.getElementById('asn-concentration-count').textContent = asy.asns.length;
-  document.getElementById('asn-concentration-node-count').textContent = fmt(asy.count);
-  document.getElementById('asn-concentration-list').innerHTML = asy.items.map(item =>
-    `<span title="${escapeHtml(item.tooltip)}">${escapeHtml(item.asn)}</span>`
-  ).join(', ');
-
-  barChart('chart-asn-concentration', asy.bars.map(b => b.label), [{
-    data: asy.bars.map(b => b.value),
-    backgroundColor: asy.bars.map(b => col(b.key)),
-  }]);
-
-  // Network x Classification (sybil)
-  const ncs = D.network_classification_sybil;
-  barChart('chart-net-class-sybil', ncs.net_labels,
-    ncs.series.map(s => ({ label: s.name, data: s.values, backgroundColor: col(s.key) })),
-    { stacked: true });
-
-  // Top prefixes
-  const tp = D.top_prefixes;
-  barChart('chart-top-prefixes', tp.labels,
-    tp.series.map(s => ({ label: s.name, data: s.values, backgroundColor: col(s.key) })),
-    {
-      horizontal: true,
-      stacked: true,
-      maintainAspectRatio: false,
-      tooltipCallbacks: {
-        afterTitle(items) {
-          const idx = items[0].dataIndex;
-          const owner = tp.owners[idx];
-          return owner && owner.asn ? owner.tooltip.split('\n') : 'ASN unknown';
-        },
-      },
-    });
-
-  // Top ASNs
-  const ta = D.top_asns;
-  barChart('chart-top-asns', ta.labels,
-    ta.series.map(s => ({ label: s.name, data: s.values, backgroundColor: col(s.key) })),
-    {
-      horizontal: true,
-      stacked: true,
-      maintainAspectRatio: false,
-      tooltipCallbacks: {
-        afterTitle(items) {
-          const idx = items[0].dataIndex;
-          return ta.tooltips[idx].split('\n');
-        },
-      },
-    });
-
-  // ASN categories
-  const ac = D.asn_categories;
-  pieChart('chart-asn-categories', ac.labels, ac.values, colKeys(ac.keys));
-
-  // Prefix table
-  const pt = D.prefix_table;
-  const sc = pt.stats.sybil_by_class;
-  document.getElementById('prefix-stats').innerHTML =
-    `${fmt(pt.stats.distinct_prefixes)} distinct prefixes across ${fmt(pt.stats.total_good_routable)} good routable nodes<br>` +
-    `${pt.stats.sybil_prefix_count} probable sybil prefixes hold:<br>` +
-    `&nbsp;&nbsp;${sc.core.pct}% of Core nodes (${fmt(sc.core.sybil)}/${fmt(sc.core.total)})<br>` +
-    `&nbsp;&nbsp;${sc.knots.pct}% of Knots nodes (${fmt(sc.knots.sybil)}/${fmt(sc.knots.total)})`;
-  document.getElementById('prefix-table-body').innerHTML = pt.rows.map(r =>
-    `<tr class="border-b border-od-bg2">
-      <td class="py-2 px-3 font-mono">${escapeHtml(r.prefix)}</td>
-      <td class="py-2 px-3" title="${escapeHtml(r.asn_tooltip)}">${escapeHtml(r.asn_name || 'Unknown')}</td>
-      <td class="text-right py-2 px-3">${fmt(r.total)}</td>
-      <td class="text-right py-2 px-3">${fmt(r.core)}</td>
-      <td class="text-right py-2 px-3">${fmt(r.knots)}</td>
-      <td class="text-right py-2 px-3">${fmt(r.other)}</td>
-    </tr>`
-  ).join('');
-
-  // ASN table
-  const at = D.asn_table;
-  const asc = at.stats.sybil_by_class;
-  document.getElementById('asn-stats').innerHTML =
-    `${fmt(at.stats.mapped_asns)} distinct ASNs across ${fmt(at.stats.total_good_routable_mapped)} mapped good routable nodes<br>` +
-    `${at.stats.sybil_asn_count} high-concentration ASNs hold:<br>` +
-    `&nbsp;&nbsp;${asc.core.pct}% of Core nodes (${fmt(asc.core.sybil)}/${fmt(asc.core.total)})<br>` +
-    `&nbsp;&nbsp;${asc.knots.pct}% of Knots nodes (${fmt(asc.knots.sybil)}/${fmt(asc.knots.total)})`;
-  document.getElementById('asn-table-body').innerHTML = at.rows.map(r =>
-    `<tr class="border-b border-od-bg2">
-      <td class="py-2 px-3 font-mono" title="${escapeHtml(r.tooltip)}">${escapeHtml(r.asn)}</td>
-      <td class="text-right py-2 px-3">${fmt(r.total)}</td>
-      <td class="text-right py-2 px-3">${fmt(r.core)}</td>
-      <td class="text-right py-2 px-3">${fmt(r.knots)}</td>
-      <td class="text-right py-2 px-3">${fmt(r.other)}</td>
-    </tr>`
-  ).join('');
-
-  // Overview pie
-  const ov = D.overview_pie;
-  pieChart('chart-overview', ov.labels, ov.values, colKeys(ov.keys));
-
-  // Custom user agents
-  const cu = D.custom_user_agents;
-  document.getElementById('custom-ua-stats').textContent =
-    `${fmt(cu.total)} total nodes with non-standard user agents (${cu.distinct} distinct, ${cu.items.length} with count > 1)`;
-  document.getElementById('custom-ua-body').innerHTML = cu.items.map(r =>
-    `<tr class="border-b border-od-bg2">
-      <td class="py-2 px-3 font-mono">${escapeHtml(r.ua)}</td>
-      <td class="text-right py-2 px-3">${fmt(r.count)}</td>
-    </tr>`
-  ).join('');
+  return value;
 }
 
-main();
+function barColor(key) {
+  const colors = {
+    core: "#c98752",
+    other: "#6d7482",
+    ipv4: "#3d93a2",
+    ipv6: "#caa34f",
+    tor: "#a766c0",
+    i2p: "#a8684c",
+    hosting: "#c64c5b",
+    isp: "#3d93a2",
+    business: "#6d9f56",
+    education_research: "#4e8ed1",
+    government_admin: "#caa34f",
+    p2p_v2: "#a78bfa",
+    witness: "#72d49b",
+    compact_filters: "#4cc9f0",
+    bloom: "#f2c66d",
+    "2h": "#4cc9f0",
+    "8h": "#a78bfa",
+    "1d": "#72d49b",
+    "1w": "#f2c66d",
+    "1m": "#f29d60",
+  };
+  return colors[key] || "#6d7482";
+}
+
+function makeCard(label, value, detail) {
+  return `<article class="summary-card">
+    <span>${label}</span>
+    <strong>${value}</strong>
+    ${detail ? `<small>${detail}</small>` : ""}
+  </article>`;
+}
+
+function renderBars(target, labels, values, keys, options = {}) {
+  const max = Math.max(...values, 0);
+  const palette = ["#4cc9f0", "#a78bfa", "#72d49b", "#f2c66d", "#ef6f7a", "#f29d60"];
+  target.innerHTML = labels.map((label, i) => {
+    const value = values[i] || 0;
+    const width = max ? (value / max * 100).toFixed(2) : 0;
+    const detail = options.detail ? options.detail(i) : fmt(value);
+    const color = keys && keys[i] ? barColor(keys[i]) : palette[i % palette.length];
+    return `<div class="bar-row">
+      <div class="bar-meta">
+        <span title="${escapeAttr(label)}">${escapeHtml(label)}</span>
+        <strong>${detail}</strong>
+      </div>
+      <div class="bar-track" aria-hidden="true">
+        <span style="width:${width}%;background:${color}"></span>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function escapeHtml(value) {
+  return text(value, "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[c]));
+}
+
+function escapeAttr(value) {
+  return escapeHtml(value).replace(/\n/g, " ");
+}
+
+function render() {
+  fetch("data.json")
+    .then((response) => {
+      if (!response.ok) throw new Error(`data.json returned ${response.status}`);
+      return response.json();
+    })
+    .then((data) => {
+      const summary = requireObject(data, "summary");
+      const classification = requireObject(data, "classification");
+      const networks = requireObject(data, "networks");
+      const freshness = requireObject(data, "freshness");
+      const reliability = requireObject(data, "reliability");
+      const chain = requireObject(data, "chain_health");
+      const services = requireObject(data, "service_flags");
+      const topUa = requireObject(data, "top_user_agents");
+      const infra = requireObject(data, "infrastructure");
+      const asnCategories = requireObject(data, "asn_categories");
+      const asnTable = requireObject(data, "asn_table");
+      const prefixTable = requireObject(data, "prefix_table");
+      const customUa = requireObject(data, "custom_user_agents");
+
+      $("generated-at").textContent = data.generated_at
+        ? `Generated ${new Date(data.generated_at).toLocaleString()}`
+        : "";
+
+      $("summary-cards").innerHTML = [
+        makeCard("Attempted addresses", fmt(summary.attempted), "Rows included in this dump"),
+        makeCard("Contacted", fmt(summary.contacted), pct(summary.contacted / summary.attempted * 100)),
+        makeCard("Good", fmt(summary.good), pct(summary.good / summary.contacted * 100)),
+        makeCard("No handshake", fmt(summary.no_handshake), "No successful version handshake recorded"),
+      ].join("");
+
+      $("network-table").innerHTML = networks.labels.map((label, i) => `
+        <tr>
+          <th scope="row">${escapeHtml(label)}</th>
+          <td class="num">${fmt(networks.attempted[i])}</td>
+          <td class="num">${fmt(networks.contacted[i])}</td>
+          <td class="num">${fmt(networks.good[i])}</td>
+          <td class="num">${pct(networks.contact_rates[i])}</td>
+          <td class="num">${pct(networks.good_rates[i])}</td>
+        </tr>
+      `).join("");
+
+      renderBars(
+        $("classification-bars"),
+        classification.labels,
+        classification.good,
+        classification.keys,
+        { detail: (i) => `${fmt(classification.good[i])} good / ${fmt(classification.contacted[i])} contacted (${pct(classification.good_rates[i])})` },
+      );
+
+      $("freshness-note").textContent = freshness.reference_time
+        ? `Reference time: ${new Date(freshness.reference_time * 1000).toLocaleString()}`
+        : "";
+      renderBars($("freshness-bars"), freshness.labels, freshness.counts, freshness.keys || []);
+
+      $("reliability-note").textContent =
+        `${fmt(reliability.scope_count)} contacted nodes; high availability is >=90% in the window`;
+      renderBars(
+        $("reliability-bars"),
+        reliability.items.map((item) => item.label),
+        reliability.items.map((item) => item.high_availability_pct),
+        reliability.items.map((item) => item.key),
+        { detail: (i) => `${pct(reliability.items[i].high_availability_pct)} high; median ${pct(reliability.items[i].median)}` },
+      );
+
+      $("chain-note").textContent =
+        `Latest hourly reference: ${fmt(chain.reference_height)}; ${fmt(chain.scope_count)} self-reported heights from the latest 24 hours`;
+      renderBars($("chain-bars"), chain.labels, chain.counts, chain.keys || []);
+
+      $("service-note").textContent = `${fmt(services.scope_count)} nodes in scope`;
+      renderBars(
+        $("service-bars"),
+        services.items.map((item) => item.label),
+        services.items.map((item) => item.count),
+        services.items.map((item) => item.key),
+        { detail: (i) => `${fmt(services.items[i].count)} (${pct(services.items[i].pct)})` },
+      );
+
+      renderBars($("top-ua-bars"), topUa.labels, topUa.counts, topUa.keys || []);
+
+      $("custom-ua-stats").textContent =
+        `${fmt(customUa.total)} contacted nodes across ${fmt(customUa.distinct)} distinct custom user agents`;
+      $("custom-ua-table").innerHTML = customUa.items.map((row) => `
+        <tr>
+          <th scope="row" class="mono">${escapeHtml(row.ua || row.user_agent || row.label)}</th>
+          <td class="num">${fmt(row.count)}</td>
+        </tr>
+      `).join("");
+
+      $("infra-cards").innerHTML = [
+        makeCard("Routable good", fmt(infra.routable_good), "IPv4 and IPv6 only"),
+        makeCard("Mapped good", fmt(infra.mapped_good), "Mapped to ASMap ASN"),
+        makeCard("Distinct prefixes", fmt(infra.distinct_prefixes), "IPv4 /24 and IPv6 /48"),
+        makeCard("Distinct ASNs", fmt(infra.distinct_asns), "Across mapped good nodes"),
+        makeCard("Top five ASNs", pct(infra.top_five_asn_pct), "Share of mapped good nodes"),
+        makeCard("Hosting", pct(infra.hosting_pct), "Share of mapped good nodes"),
+      ].join("");
+
+      renderBars($("asn-category-bars"), asnCategories.labels, asnCategories.values, asnCategories.keys);
+
+      $("asn-stats").textContent = asnTable.stats
+        ? `${fmt(asnTable.stats.mapped_asns || infra.distinct_asns)} mapped ASNs; table is sorted by good routable node count`
+        : "Table is sorted by good routable node count";
+      $("asn-table").innerHTML = asnTable.rows.map((row) => `
+        <tr title="${escapeAttr(row.tooltip)}">
+          <th scope="row" class="mono">${escapeHtml(row.asn)}</th>
+          <td>${escapeHtml(row.name)}</td>
+          <td>${escapeHtml(row.category)}</td>
+          <td class="num">${fmt(row.total)}</td>
+          <td class="num">${fmt(row.core)}</td>
+          <td class="num">${fmt(row.other)}</td>
+          <td class="num">${fmt(row.distinct_prefixes)}</td>
+          <td class="num">${pct(row.largest_prefix_share)}</td>
+        </tr>
+      `).join("");
+
+      $("prefix-stats").textContent = prefixTable.stats
+        ? `${fmt(prefixTable.stats.distinct_prefixes || infra.distinct_prefixes)} routable prefixes; table is sorted by good node count`
+        : "Table is sorted by good node count";
+      $("prefix-table").innerHTML = prefixTable.rows.map((row) => `
+        <tr title="${escapeAttr(row.asn_tooltip)}">
+          <th scope="row" class="mono">${escapeHtml(row.prefix)}</th>
+          <td class="mono">${escapeHtml(row.asn)}</td>
+          <td>${escapeHtml(row.asn_name)}</td>
+          <td>${escapeHtml(row.asn_category)}</td>
+          <td class="num">${fmt(row.total)}</td>
+          <td class="num">${fmt(row.core)}</td>
+          <td class="num">${fmt(row.other)}</td>
+          <td class="num">${fmt(row.distinct_fingerprints)}</td>
+          <td class="num">${pct(row.dominant_fingerprint_share)}</td>
+        </tr>
+      `).join("");
+
+      $("loading").hidden = true;
+      $("content").hidden = false;
+    })
+    .catch((err) => {
+      $("loading").hidden = true;
+      $("error").hidden = false;
+      $("error").textContent = `Unable to render dashboard: ${err.message}`;
+    });
+}
+
+render();
 </script>
 </body>
 </html>
