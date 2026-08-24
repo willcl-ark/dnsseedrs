@@ -109,7 +109,7 @@ struct CrawlInfo {
 enum CrawledNode {
     Failed(CrawlInfo),
     UpdatedInfo(CrawlInfo),
-    NewNode(CrawlInfo),
+    NewNode(CrawlInfo, u64),
 }
 
 #[derive(Debug)]
@@ -361,10 +361,13 @@ async fn get_node_addrs_v1(
                     if let Ok(s) = a.socket_addr() {
                         if let Ok(mut new_info) = NodeInfo::new(s.to_string()) {
                             new_info.services = a.services.to_u64();
-                            ret_addrs.push(CrawledNode::NewNode(CrawlInfo {
-                                node_info: new_info,
-                                age: 0,
-                            }));
+                            ret_addrs.push(CrawledNode::NewNode(
+                                CrawlInfo {
+                                    node_info: new_info,
+                                    age: 0,
+                                },
+                                tried_timestamp,
+                            ));
                         }
                     };
                 }
@@ -411,10 +414,13 @@ async fn get_node_addrs_v1(
                         Ok(s) => {
                             if let Ok(mut new_info) = NodeInfo::new(s.to_string()) {
                                 new_info.services = a.services.to_u64();
-                                ret_addrs.push(CrawledNode::NewNode(CrawlInfo {
-                                    node_info: new_info,
-                                    age: 0,
-                                }));
+                                ret_addrs.push(CrawledNode::NewNode(
+                                    CrawlInfo {
+                                        node_info: new_info,
+                                        age: 0,
+                                    },
+                                    tried_timestamp,
+                                ));
                             }
                         }
                         Err(e) => debug!("Error: {e}"),
@@ -574,10 +580,13 @@ async fn get_node_addrs_v2(
                     if let Ok(s) = a.socket_addr() {
                         if let Ok(mut new_info) = NodeInfo::new(s.to_string()) {
                             new_info.services = a.services.to_u64();
-                            ret_addrs.push(CrawledNode::NewNode(CrawlInfo {
-                                node_info: new_info,
-                                age: 0,
-                            }));
+                            ret_addrs.push(CrawledNode::NewNode(
+                                CrawlInfo {
+                                    node_info: new_info,
+                                    age: 0,
+                                },
+                                tried_timestamp,
+                            ));
                         }
                     };
                 }
@@ -624,10 +633,13 @@ async fn get_node_addrs_v2(
                         Ok(s) => {
                             if let Ok(mut new_info) = NodeInfo::new(s.to_string()) {
                                 new_info.services = a.services.to_u64();
-                                ret_addrs.push(CrawledNode::NewNode(CrawlInfo {
-                                    node_info: new_info,
-                                    age: 0,
-                                }));
+                                ret_addrs.push(CrawledNode::NewNode(
+                                    CrawlInfo {
+                                        node_info: new_info,
+                                        age: 0,
+                                    },
+                                    tried_timestamp,
+                                ));
                             }
                         }
                         Err(e) => debug!("Error: {e}"),
@@ -810,6 +822,26 @@ fn calculate_reliability(good: bool, old_reliability: f64, age: u64, window: u64
     let alpha = 1.0 - (-(age as f64) / window as f64).exp(); // 1 - e^(-delta T / tau)
     let x = if good { 1.0 } else { 0.0 };
     (alpha * x) + ((1.0 - alpha) * old_reliability) // alpha * x + (1 - alpha) * s_{t-1}
+}
+
+fn persist_announced_node(conn: &Connection, node: &NodeInfo, announced_at: u64) {
+    conn.execute(
+        "INSERT INTO nodes (
+            address, last_tried, last_seen, user_agent, services,
+            starting_height, protocol_version, try_count,
+            reliability_2h, reliability_8h, reliability_1d,
+            reliability_1w, reliability_1m, transport, last_announced
+        ) VALUES(?, 0, 0, '', ?, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, ?, ?)
+        ON CONFLICT(address) DO UPDATE SET
+            last_announced = MAX(nodes.last_announced, excluded.last_announced)",
+        params![
+            node.addr.to_string(),
+            node.services.to_be_bytes(),
+            NodeTransport::from_host(&node.addr.host).as_sql(),
+            announced_at,
+        ],
+    )
+    .unwrap();
 }
 
 fn proxy_concurrency_caps(crawl_threads: usize) -> (usize, usize) {
@@ -1367,23 +1399,8 @@ pub async fn crawler_thread(
                                 )
                                 .unwrap();
                         }
-                        CrawledNode::NewNode(info) => {
-                            locked_db_conn
-                                .execute(
-                                    "INSERT OR IGNORE INTO nodes (
-                                    address, last_tried, last_seen, user_agent, services,
-                                    starting_height, protocol_version, try_count,
-                                    reliability_2h, reliability_8h, reliability_1d,
-                                    reliability_1w, reliability_1m, transport
-                                ) VALUES(?, 0, 0, '', ?, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, ?)",
-                                    params![
-                                        &info.node_info.addr.to_string(),
-                                        info.node_info.services.to_be_bytes(),
-                                        NodeTransport::from_host(&info.node_info.addr.host)
-                                            .as_sql(),
-                                    ],
-                                )
-                                .unwrap();
+                        CrawledNode::NewNode(info, announced_at) => {
+                            persist_announced_node(&locked_db_conn, &info.node_info, announced_at);
                         }
                     }
                 }
@@ -1402,10 +1419,10 @@ pub async fn crawler_thread(
 #[cfg(test)]
 mod tests {
     use super::{
-        next_crawl_delay, pop_queued_nodes, proxy_concurrency_caps, queue_watermarks,
-        refill_leased_queues, CrawlSlots, LeasedNodeQueues,
+        next_crawl_delay, persist_announced_node, pop_queued_nodes, proxy_concurrency_caps,
+        queue_watermarks, refill_leased_queues, CrawlSlots, LeasedNodeQueues,
     };
-    use crate::common::NodeTransport;
+    use crate::common::{NodeInfo, NodeTransport};
     use rusqlite::{params, Connection};
     use std::time::Duration;
 
@@ -1426,7 +1443,8 @@ mod tests {
                 reliability_1d REAL NOT NULL,
                 reliability_1w REAL NOT NULL,
                 reliability_1m REAL NOT NULL,
-                transport INTEGER NOT NULL
+                transport INTEGER NOT NULL,
+                last_announced INTEGER NOT NULL DEFAULT 0
             )",
             [],
         )
@@ -1507,6 +1525,27 @@ mod tests {
         assert_eq!(first_last_tried, 100);
         assert_eq!(second_last_tried, 100);
         assert_eq!(untouched_last_tried, 30);
+    }
+
+    #[test]
+    fn repeated_announcement_refreshes_existing_node() {
+        let conn = setup_conn();
+        let mut node = NodeInfo::new("1.1.1.1:8333".to_string()).unwrap();
+        node.services = 1;
+
+        persist_announced_node(&conn, &node, 100);
+        persist_announced_node(&conn, &node, 200);
+        persist_announced_node(&conn, &node, 150);
+
+        let (count, last_announced): (u64, u64) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(last_announced) FROM nodes WHERE address = ?",
+                ["1.1.1.1:8333"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(last_announced, 200);
     }
 
     #[test]

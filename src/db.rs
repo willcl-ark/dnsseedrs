@@ -6,7 +6,7 @@ use log::warn;
 use rusqlite::{params, Connection};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const CURRENT_DB_VERSION: i32 = 2;
+const CURRENT_DB_VERSION: i32 = 3;
 
 pub const NODE_SELECT_COLUMNS: &str = "address, last_tried, last_seen, user_agent, services, \
     starting_height, protocol_version, try_count, reliability_2h, reliability_8h, \
@@ -54,13 +54,13 @@ fn schema_version(conn: &Connection) -> i32 {
         .unwrap()
 }
 
-fn has_transport_column(conn: &Connection) -> bool {
+fn has_column(conn: &Connection, column: &str) -> bool {
     conn.prepare("PRAGMA table_info('nodes')")
         .unwrap()
         .query_map([], |row| row.get::<usize, String>(1))
         .unwrap()
         .filter_map(Result::ok)
-        .any(|name| name == "transport")
+        .any(|name| name == column)
 }
 
 fn transport_sql_value(address: &str) -> i64 {
@@ -108,14 +108,15 @@ pub fn initialize_database(conn: &mut Connection, seednodes: &[String]) {
             reliability_1d REAL NOT NULL,
             reliability_1w REAL NOT NULL,
             reliability_1m REAL NOT NULL,
-            transport INTEGER NOT NULL DEFAULT 0
+            transport INTEGER NOT NULL DEFAULT 0,
+            last_announced INTEGER NOT NULL DEFAULT 0
         )",
         [],
     )
     .unwrap();
 
-    let mut needs_transport_backfill = schema_version(conn) < CURRENT_DB_VERSION;
-    if !has_transport_column(conn) {
+    let mut needs_transport_backfill = schema_version(conn) < 2;
+    if !has_column(conn, "transport") {
         conn.execute(
             "ALTER TABLE nodes ADD COLUMN transport INTEGER NOT NULL DEFAULT 0",
             [],
@@ -123,14 +124,22 @@ pub fn initialize_database(conn: &mut Connection, seednodes: &[String]) {
         .unwrap();
         needs_transport_backfill = true;
     }
+    if !has_column(conn, "last_announced") {
+        conn.execute(
+            "ALTER TABLE nodes ADD COLUMN last_announced INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .unwrap();
+    }
 
     let mut new_node_stmt = conn
         .prepare(
             "INSERT OR IGNORE INTO nodes (
                 address, last_tried, last_seen, user_agent, services, starting_height,
                 protocol_version, try_count, reliability_2h, reliability_8h,
-                reliability_1d, reliability_1w, reliability_1m, transport
-            ) VALUES(?, 0, 0, '', ?, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, ?)",
+                reliability_1d, reliability_1w, reliability_1m, transport,
+                last_announced
+            ) VALUES(?, 0, 0, '', ?, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, ?, 0)",
         )
         .unwrap();
     for seednode in seednodes {
@@ -239,14 +248,15 @@ mod tests {
             .unwrap();
         assert_eq!(node_count, 2);
 
-        let transport_column_present = conn
+        let column_names = conn
             .prepare("PRAGMA table_info('nodes')")
             .unwrap()
             .query_map([], |row| row.get::<usize, String>(1))
             .unwrap()
             .filter_map(Result::ok)
-            .any(|name| name == "transport");
-        assert!(transport_column_present);
+            .collect::<Vec<_>>();
+        assert!(column_names.contains(&"transport".to_string()));
+        assert!(column_names.contains(&"last_announced".to_string()));
 
         let onion_transport: i64 = conn
             .query_row(
@@ -256,6 +266,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(onion_transport, 1);
+
+        let announcement_times = conn
+            .prepare("SELECT last_announced FROM nodes ORDER BY address")
+            .unwrap()
+            .query_map([], |row| row.get::<usize, u64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(announcement_times, vec![0, 0]);
 
         let index_names = conn
             .prepare("PRAGMA index_list('nodes')")
@@ -271,6 +290,6 @@ mod tests {
         let schema_version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(schema_version, 2);
+        assert_eq!(schema_version, 3);
     }
 }
