@@ -6,7 +6,7 @@ use log::warn;
 use rusqlite::{params, Connection};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const CURRENT_DB_VERSION: i32 = 3;
+const CURRENT_DB_VERSION: i32 = 4;
 
 pub const NODE_SELECT_COLUMNS: &str = "address, last_tried, last_seen, user_agent, services, \
     starting_height, protocol_version, try_count, reliability_2h, reliability_8h, \
@@ -109,7 +109,9 @@ pub fn initialize_database(conn: &mut Connection, seednodes: &[String]) {
             reliability_1w REAL NOT NULL,
             reliability_1m REAL NOT NULL,
             transport INTEGER NOT NULL DEFAULT 0,
-            last_announced INTEGER NOT NULL DEFAULT 0
+            last_announced INTEGER NOT NULL DEFAULT 0,
+            next_crawl INTEGER NOT NULL DEFAULT 0,
+            crawl_bucket INTEGER NOT NULL DEFAULT 0
         )",
         [],
     )
@@ -131,6 +133,23 @@ pub fn initialize_database(conn: &mut Connection, seednodes: &[String]) {
         )
         .unwrap();
     }
+    let mut needs_schedule_backfill = schema_version(conn) < 4;
+    if !has_column(conn, "next_crawl") {
+        conn.execute(
+            "ALTER TABLE nodes ADD COLUMN next_crawl INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .unwrap();
+        needs_schedule_backfill = true;
+    }
+    if !has_column(conn, "crawl_bucket") {
+        conn.execute(
+            "ALTER TABLE nodes ADD COLUMN crawl_bucket INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .unwrap();
+        needs_schedule_backfill = true;
+    }
 
     let mut new_node_stmt = conn
         .prepare(
@@ -138,8 +157,8 @@ pub fn initialize_database(conn: &mut Connection, seednodes: &[String]) {
                 address, last_tried, last_seen, user_agent, services, starting_height,
                 protocol_version, try_count, reliability_2h, reliability_8h,
                 reliability_1d, reliability_1w, reliability_1m, transport,
-                last_announced
-            ) VALUES(?, 0, 0, '', ?, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, ?, 0)",
+                last_announced, next_crawl, crawl_bucket
+            ) VALUES(?, 0, 0, '', ?, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, ?, 0, 0, 0)",
         )
         .unwrap();
     for seednode in seednodes {
@@ -180,15 +199,42 @@ pub fn initialize_database(conn: &mut Connection, seednodes: &[String]) {
     if needs_transport_backfill {
         backfill_node_transports(conn);
     }
+    if needs_schedule_backfill {
+        conn.execute(
+            "UPDATE nodes SET
+                crawl_bucket = CASE
+                    WHEN try_count = 0 OR last_announced > last_tried THEN 0
+                    WHEN last_seen > 0 THEN 1
+                    ELSE 2
+                END,
+                next_crawl = CASE
+                    WHEN try_count = 0 THEN 0
+                    WHEN last_seen > 0 THEN last_tried + 600
+                    ELSE last_tried + MIN(
+                        604800,
+                        600 * (1 << MIN(MAX(try_count - 1, 0), 10))
+                    )
+                END",
+            [],
+        )
+        .unwrap();
+    }
 
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_nodes_last_tried ON nodes(last_tried)",
+        "CREATE INDEX IF NOT EXISTS idx_nodes_transport_bucket_next_crawl_address
+         ON nodes(transport, crawl_bucket, next_crawl, address)",
         [],
     )
     .unwrap();
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_nodes_transport_last_tried_address \
-         ON nodes(transport, last_tried, address)",
+        "CREATE INDEX IF NOT EXISTS idx_nodes_next_crawl ON nodes(next_crawl)",
+        [],
+    )
+    .unwrap();
+    conn.execute("DROP INDEX IF EXISTS idx_nodes_last_tried", [])
+        .unwrap();
+    conn.execute(
+        "DROP INDEX IF EXISTS idx_nodes_transport_last_tried_address",
         [],
     )
     .unwrap();
@@ -204,7 +250,7 @@ mod tests {
     use rusqlite::Connection;
 
     #[test]
-    fn initialize_database_migrates_transport_column_and_indexes() {
+    fn initialize_database_migrates_schedule_columns_and_indexes() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute(
             "CREATE TABLE nodes (
@@ -228,7 +274,7 @@ mod tests {
         conn.execute(
             "INSERT INTO nodes VALUES(
                 'duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion:8333',
-                0, 0, '', x'0000000000000000', 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0
+                100, 0, '', x'0000000000000000', 0, 0, 3, 0.0, 0.0, 0.0, 0.0, 0.0
             )",
             [],
         )
@@ -257,6 +303,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(column_names.contains(&"transport".to_string()));
         assert!(column_names.contains(&"last_announced".to_string()));
+        assert!(column_names.contains(&"next_crawl".to_string()));
+        assert!(column_names.contains(&"crawl_bucket".to_string()));
 
         let onion_transport: i64 = conn
             .query_row(
@@ -276,6 +324,16 @@ mod tests {
             .unwrap();
         assert_eq!(announcement_times, vec![0, 0]);
 
+        let (next_crawl, crawl_bucket): (u64, i64) = conn
+            .query_row(
+                "SELECT next_crawl, crawl_bucket FROM nodes WHERE address LIKE '%.onion:%'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(next_crawl, 2_500);
+        assert_eq!(crawl_bucket, 2);
+
         let index_names = conn
             .prepare("PRAGMA index_list('nodes')")
             .unwrap()
@@ -283,13 +341,15 @@ mod tests {
             .unwrap()
             .filter_map(Result::ok)
             .collect::<Vec<_>>();
-        assert!(index_names.contains(&"idx_nodes_last_tried".to_string()));
-        assert!(index_names.contains(&"idx_nodes_transport_last_tried_address".to_string()));
+        assert!(index_names.contains(&"idx_nodes_transport_bucket_next_crawl_address".to_string()));
+        assert!(index_names.contains(&"idx_nodes_next_crawl".to_string()));
+        assert!(!index_names.contains(&"idx_nodes_last_tried".to_string()));
+        assert!(!index_names.contains(&"idx_nodes_transport_last_tried_address".to_string()));
         assert!(!index_names.contains(&"idx_nodes_last_tried_address".to_string()));
 
         let schema_version: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(schema_version, 3);
+        assert_eq!(schema_version, 4);
     }
 }

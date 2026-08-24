@@ -42,12 +42,26 @@ use tokio::{
 };
 
 const CRAWL_RETRY_WINDOW: time::Duration = time::Duration::from_secs(60 * 10);
+const NEVER_SEEN_RETRY_CAP: time::Duration = time::Duration::from_secs(60 * 60 * 24 * 7);
 const MAX_IDLE_WAIT: time::Duration = time::Duration::from_secs(5);
 const MAX_ONION_CONCURRENCY: usize = 16;
 const MAX_I2P_CONCURRENCY: usize = 8;
 const LEASED_QUEUE_MULTIPLIER: usize = 8;
 const LEASED_QUEUE_LOW_WATERMARK_DIVISOR: usize = 4;
 const SOCKS5_TIMEOUT: time::Duration = time::Duration::from_secs(10);
+
+#[derive(Clone, Copy)]
+enum CrawlBucket {
+    Fresh = 0,
+    Seen = 1,
+    NeverSeen = 2,
+}
+
+impl CrawlBucket {
+    fn as_sql(self) -> i64 {
+        self as i64
+    }
+}
 
 #[derive(Default)]
 struct CrawlMinuteStats {
@@ -824,21 +838,145 @@ fn calculate_reliability(good: bool, old_reliability: f64, age: u64, window: u64
     (alpha * x) + ((1.0 - alpha) * old_reliability) // alpha * x + (1 - alpha) * s_{t-1}
 }
 
+fn never_seen_retry_delay(try_count: i64) -> time::Duration {
+    let exponent = try_count.saturating_sub(1).clamp(0, 10) as u32;
+    let seconds = CRAWL_RETRY_WINDOW
+        .as_secs()
+        .saturating_mul(1_u64 << exponent)
+        .min(NEVER_SEEN_RETRY_CAP.as_secs());
+    time::Duration::from_secs(seconds)
+}
+
 fn persist_announced_node(conn: &Connection, node: &NodeInfo, announced_at: u64) {
     conn.execute(
         "INSERT INTO nodes (
             address, last_tried, last_seen, user_agent, services,
             starting_height, protocol_version, try_count,
             reliability_2h, reliability_8h, reliability_1d,
-            reliability_1w, reliability_1m, transport, last_announced
-        ) VALUES(?, 0, 0, '', ?, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, ?, ?)
+            reliability_1w, reliability_1m, transport, last_announced,
+            next_crawl, crawl_bucket
+        ) VALUES(?, 0, 0, '', ?, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, ?, ?, 0, ?)
         ON CONFLICT(address) DO UPDATE SET
-            last_announced = MAX(nodes.last_announced, excluded.last_announced)",
+            last_announced = MAX(nodes.last_announced, excluded.last_announced),
+            next_crawl = CASE
+                WHEN excluded.last_announced > nodes.last_announced THEN
+                    MIN(
+                        nodes.next_crawl,
+                        MAX(excluded.last_announced, nodes.last_tried + ?)
+                    )
+                ELSE nodes.next_crawl
+            END,
+            crawl_bucket = CASE
+                WHEN excluded.last_announced > nodes.last_announced THEN ?
+                ELSE nodes.crawl_bucket
+            END",
         params![
             node.addr.to_string(),
             node.services.to_be_bytes(),
             NodeTransport::from_host(&node.addr.host).as_sql(),
             announced_at,
+            CrawlBucket::Fresh.as_sql(),
+            CRAWL_RETRY_WINDOW.as_secs(),
+            CrawlBucket::Fresh.as_sql(),
+        ],
+    )
+    .unwrap();
+}
+
+fn persist_failed_node(conn: &Connection, info: &CrawlInfo) {
+    let try_count = info.node_info.try_count + 1;
+    let (bucket, retry_delay) = if info.node_info.last_seen > 0 {
+        (CrawlBucket::Seen, CRAWL_RETRY_WINDOW)
+    } else {
+        (CrawlBucket::NeverSeen, never_seen_retry_delay(try_count))
+    };
+    let next_crawl = info
+        .node_info
+        .last_tried
+        .saturating_add(retry_delay.as_secs());
+
+    conn.execute(
+        "UPDATE nodes SET
+            last_tried = ?,
+            try_count = ?,
+            reliability_2h = ?,
+            reliability_8h = ?,
+            reliability_1d = ?,
+            reliability_1w = ?,
+            reliability_1m = ?,
+            crawl_bucket = CASE WHEN last_announced > ? THEN ? ELSE ? END,
+            next_crawl = CASE WHEN last_announced > ? THEN next_crawl ELSE ? END
+         WHERE address = ?",
+        params![
+            info.node_info.last_tried,
+            try_count,
+            calculate_reliability(false, info.node_info.reliability_2h, info.age, 3600 * 2),
+            calculate_reliability(false, info.node_info.reliability_8h, info.age, 3600 * 8),
+            calculate_reliability(false, info.node_info.reliability_1d, info.age, 3600 * 24),
+            calculate_reliability(
+                false,
+                info.node_info.reliability_1w,
+                info.age,
+                3600 * 24 * 7
+            ),
+            calculate_reliability(
+                false,
+                info.node_info.reliability_1m,
+                info.age,
+                3600 * 24 * 30
+            ),
+            info.node_info.last_tried,
+            CrawlBucket::Fresh.as_sql(),
+            bucket.as_sql(),
+            info.node_info.last_tried,
+            next_crawl,
+            info.node_info.addr.to_string(),
+        ],
+    )
+    .unwrap();
+}
+
+fn persist_updated_node(conn: &Connection, info: &CrawlInfo) {
+    conn.execute(
+        "UPDATE nodes SET
+            last_tried = ?,
+            last_seen = ?,
+            user_agent = ?,
+            services = ?,
+            starting_height = ?,
+            protocol_version = ?,
+            try_count = ?,
+            reliability_2h = ?,
+            reliability_8h = ?,
+            reliability_1d = ?,
+            reliability_1w = ?,
+            reliability_1m = ?,
+            next_crawl = ?,
+            crawl_bucket = ?
+         WHERE address = ?",
+        params![
+            info.node_info.last_tried,
+            info.node_info.last_seen,
+            info.node_info.user_agent,
+            info.node_info.services.to_be_bytes(),
+            info.node_info.starting_height,
+            info.node_info.protocol_version,
+            info.node_info.try_count + 1,
+            calculate_reliability(true, info.node_info.reliability_2h, info.age, 3600 * 2),
+            calculate_reliability(true, info.node_info.reliability_8h, info.age, 3600 * 8),
+            calculate_reliability(true, info.node_info.reliability_1d, info.age, 3600 * 24),
+            calculate_reliability(true, info.node_info.reliability_1w, info.age, 3600 * 24 * 7),
+            calculate_reliability(
+                true,
+                info.node_info.reliability_1m,
+                info.age,
+                3600 * 24 * 30
+            ),
+            info.node_info
+                .last_tried
+                .saturating_add(CRAWL_RETRY_WINDOW.as_secs()),
+            CrawlBucket::Seen.as_sql(),
+            info.node_info.addr.to_string(),
         ],
     )
     .unwrap();
@@ -860,31 +998,33 @@ fn queue_watermarks(concurrency: usize) -> (usize, usize) {
     (low, high)
 }
 
-fn refill_queue_for_transport(
+fn refill_queue_bucket(
     tx: &rusqlite::Transaction<'_>,
     transport: NodeTransport,
+    bucket: CrawlBucket,
     queue: &mut VecDeque<NodeInfo>,
-    due_before: u64,
+    due_at: u64,
     reservation_time: u64,
-    high_watermark: usize,
+    limit: usize,
 ) -> rusqlite::Result<usize> {
-    let target = high_watermark.saturating_sub(queue.len());
-    if target == 0 {
+    if limit == 0 {
         return Ok(0);
     }
 
     let mut select_nodes = tx.prepare(&format!(
         "SELECT {NODE_SELECT_COLUMNS} FROM nodes
          WHERE transport = ?
-           AND last_tried < ?
-         ORDER BY last_tried, address
+           AND crawl_bucket = ?
+           AND next_crawl <= ?
+         ORDER BY next_crawl, address
          LIMIT ?"
     ))?;
     let node_iter = select_nodes.query_map(
         params![
             transport.as_sql(),
-            due_before,
-            i64::try_from(target).unwrap()
+            bucket.as_sql(),
+            due_at,
+            i64::try_from(limit).unwrap()
         ],
         node_info_from_row,
     )?;
@@ -893,9 +1033,21 @@ fn refill_queue_for_transport(
         .collect::<Vec<_>>();
     drop(select_nodes);
 
-    let mut reserve_stmt = tx.prepare("UPDATE nodes SET last_tried = ? WHERE address = ?")?;
+    let mut reserve_stmt = tx.prepare(
+        "UPDATE nodes SET
+            last_tried = ?,
+            next_crawl = ?,
+            crawl_bucket = CASE WHEN last_seen > 0 THEN ? ELSE ? END
+         WHERE address = ?",
+    )?;
     for node in &nodes {
-        reserve_stmt.execute(params![reservation_time, node.addr.to_string()])?;
+        reserve_stmt.execute(params![
+            reservation_time,
+            reservation_time.saturating_add(CRAWL_RETRY_WINDOW.as_secs()),
+            CrawlBucket::Seen.as_sql(),
+            CrawlBucket::NeverSeen.as_sql(),
+            node.addr.to_string(),
+        ])?;
     }
     drop(reserve_stmt);
 
@@ -904,9 +1056,67 @@ fn refill_queue_for_transport(
     Ok(added)
 }
 
+fn refill_queue_for_transport(
+    tx: &rusqlite::Transaction<'_>,
+    transport: NodeTransport,
+    queue: &mut VecDeque<NodeInfo>,
+    due_at: u64,
+    reservation_time: u64,
+    high_watermark: usize,
+) -> rusqlite::Result<usize> {
+    let target = high_watermark.saturating_sub(queue.len());
+    if target == 0 {
+        return Ok(0);
+    }
+
+    let fresh_target = target / 4;
+    let never_seen_target = target / 8;
+    let seen_target = target - fresh_target - never_seen_target;
+    let targets = [
+        (CrawlBucket::Fresh, fresh_target),
+        (CrawlBucket::Seen, seen_target),
+        (CrawlBucket::NeverSeen, never_seen_target),
+    ];
+
+    let mut added = 0;
+    for (bucket, bucket_target) in targets {
+        added += refill_queue_bucket(
+            tx,
+            transport,
+            bucket,
+            queue,
+            due_at,
+            reservation_time,
+            bucket_target,
+        )?;
+    }
+
+    for bucket in [
+        CrawlBucket::Fresh,
+        CrawlBucket::Seen,
+        CrawlBucket::NeverSeen,
+    ] {
+        let remaining = target.saturating_sub(added);
+        if remaining == 0 {
+            break;
+        }
+        added += refill_queue_bucket(
+            tx,
+            transport,
+            bucket,
+            queue,
+            due_at,
+            reservation_time,
+            remaining,
+        )?;
+    }
+
+    Ok(added)
+}
+
 fn refill_leased_queues(
     conn: &mut Connection,
-    due_before: u64,
+    due_at: u64,
     reservation_time: u64,
     queues: &mut LeasedNodeQueues,
     direct_bounds: (usize, usize),
@@ -936,7 +1146,7 @@ fn refill_leased_queues(
             &tx,
             NodeTransport::Onion,
             &mut queues.onion,
-            due_before,
+            due_at,
             reservation_time,
             onion_bounds.1,
         )?
@@ -948,7 +1158,7 @@ fn refill_leased_queues(
             &tx,
             NodeTransport::I2P,
             &mut queues.i2p,
-            due_before,
+            due_at,
             reservation_time,
             i2p_bounds.1,
         )?
@@ -960,7 +1170,7 @@ fn refill_leased_queues(
             &tx,
             NodeTransport::Direct,
             &mut queues.direct,
-            due_before,
+            due_at,
             reservation_time,
             direct_bounds.1,
         )?
@@ -1042,27 +1252,25 @@ fn queue_has_blocked_proxy_work(
 fn next_crawl_delay(
     conn: &Connection,
     now: u64,
-    retry_window: time::Duration,
     max_idle_wait: time::Duration,
 ) -> rusqlite::Result<time::Duration> {
-    let oldest_last_tried = conn
+    let next_crawl = conn
         .query_row(
-            "SELECT last_tried FROM nodes ORDER BY last_tried LIMIT 1",
+            "SELECT next_crawl FROM nodes ORDER BY next_crawl LIMIT 1",
             [],
             |row| row.get::<usize, u64>(0),
         )
         .optional()?;
 
-    let Some(oldest_last_tried) = oldest_last_tried else {
+    let Some(next_crawl) = next_crawl else {
         return Ok(max_idle_wait);
     };
 
-    let next_due = oldest_last_tried.saturating_add(retry_window.as_secs());
-    if next_due <= now {
+    if next_crawl <= now {
         return Ok(time::Duration::ZERO);
     }
 
-    Ok(time::Duration::from_secs(next_due - now).min(max_idle_wait))
+    Ok(time::Duration::from_secs(next_crawl - now).min(max_idle_wait))
 }
 
 async fn log_crawl_stats(stats: Arc<CrawlMinuteStats>) {
@@ -1196,12 +1404,11 @@ pub async fn crawler_thread(
             .duration_since(time::SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let due_before = now.saturating_sub(CRAWL_RETRY_WINDOW.as_secs());
         {
             let mut locked_db_conn = db_conn.lock().unwrap();
             refill_leased_queues(
                 &mut locked_db_conn,
-                due_before,
+                now,
                 now,
                 &mut leased_queues,
                 direct_queue_bounds,
@@ -1225,7 +1432,7 @@ pub async fn crawler_thread(
             }
             let delay = {
                 let locked_db_conn = db_conn.lock().unwrap();
-                next_crawl_delay(&locked_db_conn, now, CRAWL_RETRY_WINDOW, MAX_IDLE_WAIT).unwrap()
+                next_crawl_delay(&locked_db_conn, now, MAX_IDLE_WAIT).unwrap()
             };
             sleep(if delay.is_zero() {
                 MAX_IDLE_WAIT
@@ -1257,7 +1464,6 @@ pub async fn crawler_thread(
                 stats_c.record_attempt();
                 let addrs = crawl_node(&node, net_status_c).await;
                 stats_c.record_result(&addrs);
-                let six_months = time::Duration::from_secs(60 * 60 * 24 * 183);
 
                 /*
                 debug!(
@@ -1270,134 +1476,9 @@ pub async fn crawler_thread(
                 locked_db_conn.execute("BEGIN TRANSACTION", []).unwrap();
                 for crawled in addrs {
                     match crawled {
-                        CrawledNode::Failed(info) => {
-                            if (node.last_seen > 0
-                                && (time::SystemTime::UNIX_EPOCH
-                                    + time::Duration::from_secs(node.last_seen))
-                                .elapsed()
-                                .unwrap()
-                                    >= six_months)
-                                || (node.last_seen == 0 && node.try_count > 10)
-                            {
-                                debug!("Deleting {} from database", info.node_info.addr);
-                                locked_db_conn
-                                    .execute(
-                                        "
-                                    DELETE FROM nodes Where address = ?",
-                                        params![info.node_info.addr.to_string(),],
-                                    )
-                                    .unwrap();
-                            } else {
-                                locked_db_conn
-                                    .execute(
-                                        "
-                                    UPDATE nodes SET
-                                        last_tried = ?,
-                                        try_count = ?,
-                                        reliability_2h = ?,
-                                        reliability_8h = ?,
-                                        reliability_1d = ?,
-                                        reliability_1w = ?,
-                                        reliability_1m = ?
-                                    WHERE address = ?",
-                                        params![
-                                            info.node_info.last_tried,
-                                            info.node_info.try_count + 1,
-                                            calculate_reliability(
-                                                false,
-                                                info.node_info.reliability_2h,
-                                                info.age,
-                                                3600 * 2
-                                            ),
-                                            calculate_reliability(
-                                                false,
-                                                info.node_info.reliability_8h,
-                                                info.age,
-                                                3600 * 8
-                                            ),
-                                            calculate_reliability(
-                                                false,
-                                                info.node_info.reliability_1d,
-                                                info.age,
-                                                3600 * 24
-                                            ),
-                                            calculate_reliability(
-                                                false,
-                                                info.node_info.reliability_1w,
-                                                info.age,
-                                                3600 * 24 * 7
-                                            ),
-                                            calculate_reliability(
-                                                false,
-                                                info.node_info.reliability_1m,
-                                                info.age,
-                                                3600 * 24 * 30
-                                            ),
-                                            info.node_info.addr.to_string(),
-                                        ],
-                                    )
-                                    .unwrap();
-                            }
-                        }
+                        CrawledNode::Failed(info) => persist_failed_node(&locked_db_conn, &info),
                         CrawledNode::UpdatedInfo(info) => {
-                            locked_db_conn
-                                .execute(
-                                    "UPDATE nodes SET
-                                    last_tried = ?,
-                                    last_seen = ?,
-                                    user_agent = ?,
-                                    services = ?,
-                                    starting_height = ?,
-                                    protocol_version = ?,
-                                    try_count = ?,
-                                    reliability_2h = ?,
-                                    reliability_8h = ?,
-                                    reliability_1d = ?,
-                                    reliability_1w = ?,
-                                    reliability_1m = ?
-                                WHERE address = ?",
-                                    params![
-                                        info.node_info.last_tried,
-                                        info.node_info.last_seen,
-                                        info.node_info.user_agent,
-                                        info.node_info.services.to_be_bytes(),
-                                        info.node_info.starting_height,
-                                        info.node_info.protocol_version,
-                                        info.node_info.try_count + 1,
-                                        calculate_reliability(
-                                            true,
-                                            info.node_info.reliability_2h,
-                                            info.age,
-                                            3600 * 2
-                                        ),
-                                        calculate_reliability(
-                                            true,
-                                            info.node_info.reliability_8h,
-                                            info.age,
-                                            3600 * 8
-                                        ),
-                                        calculate_reliability(
-                                            true,
-                                            info.node_info.reliability_1d,
-                                            info.age,
-                                            3600 * 24
-                                        ),
-                                        calculate_reliability(
-                                            true,
-                                            info.node_info.reliability_1w,
-                                            info.age,
-                                            3600 * 24 * 7
-                                        ),
-                                        calculate_reliability(
-                                            true,
-                                            info.node_info.reliability_1m,
-                                            info.age,
-                                            3600 * 24 * 30
-                                        ),
-                                        info.node_info.addr.to_string(),
-                                    ],
-                                )
-                                .unwrap();
+                            persist_updated_node(&locked_db_conn, &info)
                         }
                         CrawledNode::NewNode(info, announced_at) => {
                             persist_announced_node(&locked_db_conn, &info.node_info, announced_at);
@@ -1419,8 +1500,9 @@ pub async fn crawler_thread(
 #[cfg(test)]
 mod tests {
     use super::{
-        next_crawl_delay, persist_announced_node, pop_queued_nodes, proxy_concurrency_caps,
-        queue_watermarks, refill_leased_queues, CrawlSlots, LeasedNodeQueues,
+        never_seen_retry_delay, next_crawl_delay, persist_announced_node, persist_failed_node,
+        pop_queued_nodes, proxy_concurrency_caps, queue_watermarks, refill_leased_queues,
+        CrawlBucket, CrawlInfo, CrawlSlots, LeasedNodeQueues,
     };
     use crate::common::{NodeInfo, NodeTransport};
     use rusqlite::{params, Connection};
@@ -1444,33 +1526,61 @@ mod tests {
                 reliability_1w REAL NOT NULL,
                 reliability_1m REAL NOT NULL,
                 transport INTEGER NOT NULL,
-                last_announced INTEGER NOT NULL DEFAULT 0
+                last_announced INTEGER NOT NULL DEFAULT 0,
+                next_crawl INTEGER NOT NULL DEFAULT 0,
+                crawl_bucket INTEGER NOT NULL DEFAULT 0
             )",
             [],
         )
         .unwrap();
-        conn.execute("CREATE INDEX idx_nodes_last_tried ON nodes(last_tried)", [])
-            .unwrap();
         conn.execute(
-            "CREATE INDEX idx_nodes_transport_last_tried_address ON nodes(transport, last_tried, address)",
+            "CREATE INDEX idx_nodes_transport_bucket_next_crawl_address
+             ON nodes(transport, crawl_bucket, next_crawl, address)",
             [],
         )
         .unwrap();
+        conn.execute("CREATE INDEX idx_nodes_next_crawl ON nodes(next_crawl)", [])
+            .unwrap();
         conn
     }
 
     fn insert_node(conn: &Connection, address: &str, last_tried: u64) {
+        insert_scheduled_node(
+            conn,
+            address,
+            last_tried,
+            0,
+            0,
+            last_tried,
+            CrawlBucket::Fresh,
+        );
+    }
+
+    fn insert_scheduled_node(
+        conn: &Connection,
+        address: &str,
+        last_tried: u64,
+        last_seen: u64,
+        try_count: i64,
+        next_crawl: u64,
+        bucket: CrawlBucket,
+    ) {
         conn.execute(
             "INSERT INTO nodes (
                 address, last_tried, last_seen, user_agent, services, starting_height,
                 protocol_version, try_count, reliability_2h, reliability_8h,
-                reliability_1d, reliability_1w, reliability_1m, transport
-            ) VALUES(?, ?, 0, '', ?, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, ?)",
+                reliability_1d, reliability_1w, reliability_1m, transport,
+                last_announced, next_crawl, crawl_bucket
+            ) VALUES(?, ?, ?, '', ?, 0, 0, ?, 0.0, 0.0, 0.0, 0.0, 0.0, ?, 0, ?, ?)",
             params![
                 address,
                 last_tried,
+                last_seen,
                 0_u64.to_be_bytes(),
-                NodeTransport::from_address(address).unwrap().as_sql()
+                try_count,
+                NodeTransport::from_address(address).unwrap().as_sql(),
+                next_crawl,
+                bucket.as_sql(),
             ],
         )
         .unwrap();
@@ -1528,24 +1638,149 @@ mod tests {
     }
 
     #[test]
+    fn refill_reserves_bounded_shares_for_each_priority() {
+        let mut conn = setup_conn();
+        for address in ["1.1.1.1:8333", "1.1.1.2:8333"] {
+            insert_scheduled_node(&conn, address, 0, 0, 0, 0, CrawlBucket::Fresh);
+        }
+        for address in [
+            "8.8.8.1:8333",
+            "8.8.8.2:8333",
+            "8.8.8.3:8333",
+            "8.8.8.4:8333",
+            "8.8.8.5:8333",
+        ] {
+            insert_scheduled_node(&conn, address, 0, 1, 1, 0, CrawlBucket::Seen);
+        }
+        for address in ["9.9.9.1:8333", "9.9.9.2:8333"] {
+            insert_scheduled_node(&conn, address, 0, 0, 1, 0, CrawlBucket::NeverSeen);
+        }
+        let mut queues = LeasedNodeQueues::default();
+
+        refill_leased_queues(&mut conn, 100, 200, &mut queues, (1, 8), (0, 0), (0, 0)).unwrap();
+        let leased = pop_queued_nodes(
+            &mut queues,
+            CrawlSlots {
+                global: 8,
+                onion: 0,
+                i2p: 0,
+            },
+        );
+        let leased_addrs = leased
+            .iter()
+            .map(|node| node.addr.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            leased_addrs,
+            [
+                "1.1.1.1:8333",
+                "1.1.1.2:8333",
+                "8.8.8.1:8333",
+                "8.8.8.2:8333",
+                "8.8.8.3:8333",
+                "8.8.8.4:8333",
+                "8.8.8.5:8333",
+                "9.9.9.1:8333",
+            ]
+        );
+    }
+
+    #[test]
     fn repeated_announcement_refreshes_existing_node() {
         let conn = setup_conn();
+        insert_scheduled_node(
+            &conn,
+            "1.1.1.1:8333",
+            100,
+            0,
+            3,
+            10_000,
+            CrawlBucket::NeverSeen,
+        );
         let mut node = NodeInfo::new("1.1.1.1:8333".to_string()).unwrap();
         node.services = 1;
 
-        persist_announced_node(&conn, &node, 100);
         persist_announced_node(&conn, &node, 200);
         persist_announced_node(&conn, &node, 150);
 
-        let (count, last_announced): (u64, u64) = conn
+        let (count, last_announced, next_crawl, crawl_bucket): (u64, u64, u64, i64) = conn
             .query_row(
-                "SELECT COUNT(*), MAX(last_announced) FROM nodes WHERE address = ?",
+                "SELECT COUNT(*), MAX(last_announced), next_crawl, crawl_bucket
+                 FROM nodes WHERE address = ?",
                 ["1.1.1.1:8333"],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
         assert_eq!(count, 1);
         assert_eq!(last_announced, 200);
+        assert_eq!(next_crawl, 700);
+        assert_eq!(crawl_bucket, CrawlBucket::Fresh.as_sql());
+    }
+
+    #[test]
+    fn repeated_failures_are_retained_with_capped_backoff() {
+        let conn = setup_conn();
+        insert_scheduled_node(&conn, "1.1.1.1:8333", 0, 0, 11, 0, CrawlBucket::NeverSeen);
+        let mut node = NodeInfo::new("1.1.1.1:8333".to_string()).unwrap();
+        node.last_tried = 100;
+        node.try_count = 11;
+
+        persist_failed_node(
+            &conn,
+            &CrawlInfo {
+                node_info: node,
+                age: 100,
+            },
+        );
+
+        let (try_count, next_crawl, crawl_bucket): (i64, u64, i64) = conn
+            .query_row(
+                "SELECT try_count, next_crawl, crawl_bucket FROM nodes WHERE address = ?",
+                ["1.1.1.1:8333"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(try_count, 12);
+        assert_eq!(next_crawl, 604_900);
+        assert_eq!(crawl_bucket, CrawlBucket::NeverSeen.as_sql());
+    }
+
+    #[test]
+    fn previously_seen_failure_is_retained_for_normal_retry() {
+        let conn = setup_conn();
+        insert_scheduled_node(&conn, "1.1.1.1:8333", 0, 1, 100, 0, CrawlBucket::Seen);
+        let mut node = NodeInfo::new("1.1.1.1:8333".to_string()).unwrap();
+        node.last_tried = 100;
+        node.last_seen = 1;
+        node.try_count = 100;
+
+        persist_failed_node(
+            &conn,
+            &CrawlInfo {
+                node_info: node,
+                age: 100,
+            },
+        );
+
+        let (try_count, next_crawl, crawl_bucket): (i64, u64, i64) = conn
+            .query_row(
+                "SELECT try_count, next_crawl, crawl_bucket FROM nodes WHERE address = ?",
+                ["1.1.1.1:8333"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(try_count, 101);
+        assert_eq!(next_crawl, 700);
+        assert_eq!(crawl_bucket, CrawlBucket::Seen.as_sql());
+    }
+
+    #[test]
+    fn never_seen_backoff_doubles_and_caps() {
+        assert_eq!(never_seen_retry_delay(1), Duration::from_secs(600));
+        assert_eq!(never_seen_retry_delay(2), Duration::from_secs(1_200));
+        assert_eq!(never_seen_retry_delay(11), Duration::from_secs(604_800));
+        assert_eq!(never_seen_retry_delay(100), Duration::from_secs(604_800));
     }
 
     #[test]
@@ -1593,13 +1828,19 @@ mod tests {
                 "EXPLAIN QUERY PLAN
                  SELECT address, last_tried FROM nodes
                  WHERE transport = ?
-                   AND last_tried < ?
-                 ORDER BY last_tried, address
+                   AND crawl_bucket = ?
+                   AND next_crawl <= ?
+                 ORDER BY next_crawl, address
                  LIMIT ?",
             )
             .unwrap()
             .query_map(
-                params![NodeTransport::Direct.as_sql(), 100_u64, 1_i64],
+                params![
+                    NodeTransport::Direct.as_sql(),
+                    CrawlBucket::Fresh.as_sql(),
+                    100_u64,
+                    1_i64
+                ],
                 |row| row.get::<usize, String>(3),
             )
             .unwrap()
@@ -1608,10 +1849,10 @@ mod tests {
 
         assert!(plan_rows
             .iter()
-            .any(|detail| detail.contains("idx_nodes_transport_last_tried_address")));
+            .any(|detail| detail.contains("idx_nodes_transport_bucket_next_crawl_address")));
         assert!(plan_rows
             .iter()
-            .any(|detail| detail.contains("transport=? AND last_tried<?")));
+            .any(|detail| detail.contains("transport=? AND crawl_bucket=? AND next_crawl<?")));
     }
 
     #[test]
@@ -1624,10 +1865,9 @@ mod tests {
     #[test]
     fn next_crawl_delay_caps_idle_wait() {
         let conn = setup_conn();
-        insert_node(&conn, "1.1.1.1:8333", 100);
+        insert_node(&conn, "1.1.1.1:8333", 300);
 
-        let delay =
-            next_crawl_delay(&conn, 200, Duration::from_secs(600), Duration::from_secs(5)).unwrap();
+        let delay = next_crawl_delay(&conn, 200, Duration::from_secs(5)).unwrap();
         assert_eq!(delay, Duration::from_secs(5));
     }
 
