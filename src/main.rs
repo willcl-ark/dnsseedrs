@@ -56,6 +56,10 @@ struct Args {
     #[arg(short, long, default_value_t = 24)]
     threads: usize,
 
+    /// Maximum aggregate crawl attempts to start per second.
+    #[arg(long)]
+    crawl_rate: Option<u64>,
+
     /// protocol, IP, and port to bind to for servince DNS requests. Defaults are udp://0.0.0.0:53
     /// and tcp://0.0.0.0:53. Specify multiple times for multiple binds
     #[arg(short, long)]
@@ -93,6 +97,13 @@ async fn main() {
         eprintln!("--threads must be at least 1");
         std::process::exit(1);
     }
+    if args.crawl_rate == Some(0) {
+        eprintln!("--crawl-rate must be at least 1");
+        std::process::exit(1);
+    }
+    let crawl_rate = args
+        .crawl_rate
+        .unwrap_or_else(|| args.threads.div_ceil(10) as u64);
 
     // Pick the network
     let chain_p = Network::from_core_arg(&args.chain);
@@ -185,7 +196,7 @@ async fn main() {
     let db_conn_c = crawl_db_conn.clone();
     let net_status_c: NetStatus = net_status.clone();
     let t_crawl = tokio::spawn(async move {
-        crawler_thread(db_conn_c, args.threads, net_status_c).await;
+        crawler_thread(db_conn_c, args.threads, crawl_rate, net_status_c).await;
     });
 
     // Start dumper thread

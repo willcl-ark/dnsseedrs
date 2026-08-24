@@ -63,6 +63,40 @@ impl CrawlBucket {
     }
 }
 
+struct CrawlRateLimiter {
+    next_start: time::Instant,
+    spacing: time::Duration,
+}
+
+impl CrawlRateLimiter {
+    fn new(rate: u64) -> Self {
+        let interval_nanos = (1_000_000_000_u64 / rate.max(1)).max(1);
+        Self {
+            next_start: time::Instant::now(),
+            spacing: time::Duration::from_nanos(interval_nanos),
+        }
+    }
+
+    async fn wait(&mut self) {
+        let now = time::Instant::now();
+        let delay = reserve_rate_slot(&mut self.next_start, now, self.spacing);
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
+    }
+}
+
+fn reserve_rate_slot(
+    next_start: &mut time::Instant,
+    now: time::Instant,
+    spacing: time::Duration,
+) -> time::Duration {
+    let scheduled = (*next_start).max(now);
+    let delay = scheduled.duration_since(now);
+    *next_start = scheduled + spacing;
+    delay
+}
+
 #[derive(Default)]
 struct CrawlMinuteStats {
     attempts: AtomicU64,
@@ -1293,6 +1327,7 @@ async fn log_crawl_stats(stats: Arc<CrawlMinuteStats>) {
 pub async fn crawler_thread(
     db_conn: Arc<Mutex<rusqlite::Connection>>,
     threads: usize,
+    crawl_rate: u64,
     mut net_status: NetStatus,
 ) {
     // Check proxies
@@ -1390,6 +1425,8 @@ pub async fn crawler_thread(
     let stats = Arc::new(CrawlMinuteStats::default());
     tokio::spawn(log_crawl_stats(stats.clone()));
     let mut leased_queues = LeasedNodeQueues::default();
+    let mut rate_limiter = CrawlRateLimiter::new(crawl_rate);
+    info!("Crawl start rate cap: {crawl_rate}/s");
 
     // Crawler loop
     loop {
@@ -1450,6 +1487,7 @@ pub async fn crawler_thread(
             let onion_sem_clone = onion_sem.clone();
             let i2p_sem_clone = i2p_sem.clone();
             let stats_c = stats.clone();
+            rate_limiter.wait().await;
             let permit = sem_clone.acquire_owned().await.unwrap();
             let proxy_permit = match NodeTransport::from_host(&node.addr.host) {
                 NodeTransport::Direct => None,
@@ -1502,11 +1540,11 @@ mod tests {
     use super::{
         never_seen_retry_delay, next_crawl_delay, persist_announced_node, persist_failed_node,
         pop_queued_nodes, proxy_concurrency_caps, queue_watermarks, refill_leased_queues,
-        CrawlBucket, CrawlInfo, CrawlSlots, LeasedNodeQueues,
+        reserve_rate_slot, CrawlBucket, CrawlInfo, CrawlSlots, LeasedNodeQueues,
     };
     use crate::common::{NodeInfo, NodeTransport};
     use rusqlite::{params, Connection};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn setup_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -1781,6 +1819,26 @@ mod tests {
         assert_eq!(never_seen_retry_delay(2), Duration::from_secs(1_200));
         assert_eq!(never_seen_retry_delay(11), Duration::from_secs(604_800));
         assert_eq!(never_seen_retry_delay(100), Duration::from_secs(604_800));
+    }
+
+    #[test]
+    fn rate_limiter_reserves_serial_start_slots() {
+        let now = Instant::now();
+        let spacing = Duration::from_millis(100);
+        let mut next_start = now;
+
+        assert_eq!(
+            reserve_rate_slot(&mut next_start, now, spacing),
+            Duration::ZERO
+        );
+        assert_eq!(
+            reserve_rate_slot(&mut next_start, now, spacing),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            reserve_rate_slot(&mut next_start, now + Duration::from_millis(250), spacing),
+            Duration::ZERO
+        );
     }
 
     #[test]
