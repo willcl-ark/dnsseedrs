@@ -90,22 +90,22 @@
       </div>
       <div class="four-column">
         <article>
-          <h3>Freshness</h3>
+          <h3 title="Time since each contacted address last completed a successful handshake, relative to the newest recorded handshake">Freshness</h3>
           <p id="freshness-note" class="note"></p>
           <div id="freshness-bars" class="bar-list"></div>
         </article>
         <article>
-          <h3>Reliability</h3>
+          <h3 title="Exponential moving-average success rates for contacted nodes; high availability means at least 90% in the selected window">Reliability</h3>
           <p id="reliability-note" class="note"></p>
           <div id="reliability-bars" class="bar-list"></div>
         </article>
         <article>
-          <h3>Chain health</h3>
+          <h3 title="Self-reported block heights from nodes contacted within the latest 24 hours, compared with an hourly network reference">Chain health</h3>
           <p id="chain-note" class="note"></p>
           <div id="chain-bars" class="bar-list"></div>
         </article>
         <article>
-          <h3>Advertised services</h3>
+          <h3 title="Protocol service flags advertised during the handshake by nodes currently classified as good">Advertised services</h3>
           <p id="service-note" class="note"></p>
           <div id="service-bars" class="bar-list"></div>
         </article>
@@ -146,8 +146,8 @@
     <section class="band" aria-labelledby="infra-title">
       <div class="section-heading">
         <div>
-          <h2 id="infra-title">Infrastructure</h2>
-          <p>Routable good nodes grouped by ASMap ASN and IP prefix. These are concentration indicators, not unique users or machines.</p>
+          <h2 id="infra-title">Public IP infrastructure</h2>
+          <p>Good IPv4 and IPv6 nodes grouped by public IP prefix and ASN. Tor and I2P are excluded because their overlay addresses have no public IP/ASN mapping. These are concentration indicators, not unique users or machines.</p>
         </div>
       </div>
       <div id="infra-cards" class="summary-grid compact"></div>
@@ -395,7 +395,7 @@ function render() {
       `).join("");
 
       $("infra-cards").innerHTML = [
-        makeCard("Routable good", fmt(infra.routable_good), "IPv4 and IPv6 only"),
+        makeCard("Public IP good nodes", fmt(infra.routable_good), "IPv4 and IPv6 only"),
         makeCard("Mapped good", fmt(infra.mapped_good), "Mapped to ASMap ASN"),
         makeCard("Distinct prefixes", fmt(infra.distinct_prefixes), "IPv4 /24 and IPv6 /48"),
         makeCard("Distinct ASNs", fmt(infra.distinct_asns), "Across mapped good nodes"),
