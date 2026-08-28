@@ -38,6 +38,12 @@ SERVICE_FLAGS = [
     ("Compact filters", "compact_filters", 1 << 6),
     ("Bloom filters", "bloom", 1 << 2),
 ]
+ACTIVITY_WINDOWS = [
+    ("1 hour", 60 * 60),
+    ("2 hours", 2 * 60 * 60),
+    ("24 hours", 24 * 60 * 60),
+    ("7 days", 7 * 24 * 60 * 60),
+]
 
 
 def fetch_seeds(force: bool = False) -> None:
@@ -94,10 +100,13 @@ def parse_seeds(path: str) -> list[dict]:
             if not line or line.startswith("#"):
                 continue
             m = re.search(r'"([^"]*)"', line)
+            if not m:
+                continue
             user_agent = m.group(1) if m else ""
-            rest = line[: m.start()].strip() if m else line
+            rest = line[: m.start()].strip()
             parts = rest.split()
-            if len(parts) < 11:
+            metadata = line[m.end() :].split()
+            if len(parts) < 11 or len(metadata) < 2:
                 continue
             rows.append(
                 {
@@ -112,6 +121,8 @@ def parse_seeds(path: str) -> list[dict]:
                     "services": int(parts[9], 16),
                     "protocol_version": int(parts[10]),
                     "user_agent": user_agent,
+                    "last_tried": int(metadata[0]),
+                    "try_count": int(metadata[1]),
                 }
             )
     return rows
@@ -284,6 +295,22 @@ def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> 
 
     def percentage(part: int, whole: int) -> float:
         return round(part / whole * 100, 1) if whole else 0.0
+
+    def activity_stats(timestamp_key: str) -> dict:
+        reference_time = max((r[timestamp_key] for r in rows), default=0)
+        counts = [
+            sum(
+                0 < r[timestamp_key] and reference_time - r[timestamp_key] <= age
+                for r in rows
+            )
+            for _, age in ACTIVITY_WINDOWS
+        ]
+        return {
+            "reference_time": reference_time,
+            "labels": [label for label, _ in ACTIVITY_WINDOWS],
+            "counts": counts,
+            "overall": sum(r[timestamp_key] > 0 for r in rows),
+        }
 
     contacted_rows = [r for r in rows if r["last_seen"] > 0]
     good_rows = [r for r in rows if r["good"]]
@@ -561,6 +588,10 @@ def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> 
             "scope_count": len(contacted_rows),
             "labels": freshness_labels,
             "counts": freshness_counts,
+        },
+        "activity": {
+            "attempts": activity_stats("last_tried"),
+            "handshakes": activity_stats("last_seen"),
         },
         "reliability": {
             "scope_count": len(contacted_rows),
