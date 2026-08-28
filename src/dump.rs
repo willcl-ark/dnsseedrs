@@ -53,7 +53,7 @@ pub async fn dumper_thread(db_file: &str, dump_file: &str, chain: &Network) {
         info!("Starting write of {} with {} nodes", dump_file, node_count);
         let mut txt_tmp_file = File::create(&txt_tmp_path).await.unwrap();
         let header = format!(
-            "{:<70}{:<6}{:<12}{:^8}{:^8}{:^8}{:^8}{:^8}{:^9}{:<18}{:<8}user_agent\n",
+            "{:<70}{:<6}{:<12}{:^8}{:^8}{:^8}{:^8}{:^8}{:^9}{:<18}{:<8}user_agent {:<12}{:<10}\n",
             "# address",
             "good",
             "last_seen",
@@ -64,12 +64,14 @@ pub async fn dumper_thread(db_file: &str, dump_file: &str, chain: &Network) {
             "%(1m)",
             "blocks",
             "services",
-            "version"
+            "version",
+            "last_tried",
+            "try_count",
         );
         let _ = txt_tmp_file.write(header.as_bytes()).await.unwrap();
         for node in nodes {
             let line = format!(
-                "{:<70}{:<6}{:<12}{:>6.2}% {:>6.2}% {:>6.2}% {:>6.2}% {:>7.2}% {:<8}{:0>16x}  {:<8}\"{}\"\n",
+                "{:<70}{:<6}{:<12}{:>6.2}% {:>6.2}% {:>6.2}% {:>6.2}% {:>7.2}% {:<8}{:0>16x}  {:<8}\"{}\" {} {}\n",
                 node.addr.to_string(),
                 i32::from(is_good(&node, chain)),
                 node.last_seen,
@@ -82,6 +84,8 @@ pub async fn dumper_thread(db_file: &str, dump_file: &str, chain: &Network) {
                 node.services,
                 node.protocol_version,
                 node.user_agent,
+                node.last_tried,
+                node.try_count,
             );
             let _ = txt_tmp_file.write(line.as_bytes()).await.unwrap();
         }
