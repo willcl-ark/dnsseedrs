@@ -108,6 +108,7 @@ class BuildDataTest(unittest.TestCase):
                 "asn_categories",
                 "asn_table",
                 "custom_user_agents",
+                "overlay_fingerprints",
             },
         )
         self.assertEqual(
@@ -117,6 +118,8 @@ class BuildDataTest(unittest.TestCase):
                 "asn",
                 "asn_name",
                 "asn_category",
+                "asn_country",
+                "asn_country_code",
                 "asn_tooltip",
                 "total",
                 "core",
@@ -131,6 +134,8 @@ class BuildDataTest(unittest.TestCase):
                 "asn",
                 "name",
                 "category",
+                "country",
+                "country_code",
                 "tooltip",
                 "total",
                 "core",

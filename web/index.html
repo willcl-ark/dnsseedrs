@@ -177,6 +177,26 @@
         <div id="asn-category-bars" class="bar-list"></div>
       </div>
       <div class="infra-block">
+        <h3>Overlay network fingerprints</h3>
+        <p class="note">Tor and I2P are not mapped to public IP infrastructure. These counts cover every contacted overlay node, with good-node detail shown separately.</p>
+        <div class="table-wrap">
+          <table class="overlay-data-table">
+            <caption>Distinct fingerprints reported by Tor and I2P nodes</caption>
+            <thead>
+              <tr>
+                <th>Network</th>
+                <th class="num">Contacted</th>
+                <th class="num">Good</th>
+                <th class="num">Contacted fingerprints</th>
+                <th class="num">Good fingerprints</th>
+                <th class="num">Dominant good fingerprint</th>
+              </tr>
+            </thead>
+            <tbody id="overlay-fingerprint-table"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="infra-block">
         <h3>Top ASNs</h3>
         <p id="asn-stats" class="note"></p>
         <div class="table-wrap">
@@ -184,16 +204,16 @@
             <caption>Largest autonomous systems by good routable node count</caption>
             <thead>
               <tr>
-                <th>ASN</th>
-                <th>Owner</th>
-                <th>Category</th>
-                <th class="num">Total</th>
-                <th class="num">Core</th>
-                <th class="num">Other</th>
-                <th class="num">Prefixes</th>
-                <th class="num">Largest prefix</th>
-                <th class="num" title="Distinct combinations of user agent, service flags, and protocol version">Fingerprints</th>
-                <th class="num" title="Share matching the most common fingerprint in this ASN">Dominant fingerprint</th>
+                <th data-sort-key="asn">ASN</th>
+                <th data-sort-key="name">Owner</th>
+                <th data-sort-key="category">Category</th>
+                <th class="num" data-sort-key="total">Total</th>
+                <th class="num" data-sort-key="core">Core</th>
+                <th class="num" data-sort-key="other">Other</th>
+                <th class="num" data-sort-key="distinct_prefixes">Prefixes</th>
+                <th class="num" data-sort-key="largest_prefix_share">Largest prefix</th>
+                <th class="num" data-sort-key="distinct_fingerprints" title="Distinct combinations of user agent, service flags, and protocol version">Fingerprints</th>
+                <th class="num" data-sort-key="dominant_fingerprint_share" title="Share matching the most common fingerprint in this ASN">Dominant fingerprint</th>
               </tr>
             </thead>
             <tbody id="asn-table"></tbody>
@@ -208,15 +228,15 @@
             <caption>Largest IPv4 /24 and IPv6 /48 prefixes by good routable node count</caption>
             <thead>
               <tr>
-                <th>Prefix</th>
-                <th>ASN</th>
-                <th>Owner</th>
-                <th>Category</th>
-                <th class="num">Total</th>
-                <th class="num">Core</th>
-                <th class="num">Other</th>
-                <th class="num" title="Distinct combinations of user agent, service flags, and protocol version">Fingerprints</th>
-                <th class="num" title="Share matching the most common fingerprint in this prefix">Dominant fingerprint</th>
+                <th data-sort-key="prefix">Prefix</th>
+                <th data-sort-key="asn">ASN</th>
+                <th data-sort-key="asn_name">Owner</th>
+                <th data-sort-key="asn_category">Category</th>
+                <th class="num" data-sort-key="total">Total</th>
+                <th class="num" data-sort-key="core">Core</th>
+                <th class="num" data-sort-key="other">Other</th>
+                <th class="num" data-sort-key="distinct_fingerprints" title="Distinct combinations of user agent, service flags, and protocol version">Fingerprints</th>
+                <th class="num" data-sort-key="dominant_fingerprint_share" title="Share matching the most common fingerprint in this prefix">Dominant fingerprint</th>
               </tr>
             </thead>
             <tbody id="prefix-table"></tbody>
@@ -325,6 +345,53 @@ function escapeAttr(value) {
   return escapeHtml(value).replace(/\n/g, " ");
 }
 
+function countryFlag(code, country) {
+  const normalized = String(code || "").trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(normalized)) return "";
+  const flag = [...normalized].map((letter) =>
+    String.fromCodePoint(letter.charCodeAt(0) + 0x1f1a5)
+  ).join("");
+  return `<span class="country-flag" role="img" aria-label="${escapeAttr(country || normalized)}">${flag}</span>`;
+}
+
+function sortableTable(tableSelector, rows, renderRow) {
+  const table = document.querySelector(tableSelector);
+  const headers = [...table.querySelectorAll("th[data-sort-key]")];
+  let sortKey = "total";
+  let descending = true;
+  headers.forEach((header) => {
+    const key = header.dataset.sortKey;
+    const label = header.textContent.trim();
+    header.innerHTML = `<button type="button" class="sort-button" aria-label="Sort by ${escapeAttr(label)}">${escapeHtml(label)} <span class="sort-indicator" aria-hidden="true"></span></button>`;
+    header.querySelector("button").addEventListener("click", () => {
+      if (sortKey === key) descending = !descending;
+      else {
+        sortKey = key;
+        descending = typeof rows[0]?.[key] === "number";
+      }
+      headers.forEach((item) => {
+        item.querySelector(".sort-indicator").textContent = item.dataset.sortKey === sortKey
+          ? (descending ? "↓" : "↑") : "";
+      });
+      render();
+    });
+  });
+  function render() {
+    const sorted = [...rows].sort((left, right) => {
+      const a = left[sortKey] ?? "";
+      const b = right[sortKey] ?? "";
+      const comparison = typeof a === "number" && typeof b === "number"
+        ? a - b
+        : String(a).localeCompare(String(b), undefined, { sensitivity: "base", numeric: true });
+      return descending ? -comparison : comparison;
+    });
+    table.querySelector("tbody").innerHTML = sorted.map(renderRow).join("");
+  }
+  headers.find((header) => header.dataset.sortKey === sortKey)
+    ?.querySelector(".sort-indicator").append("↓");
+  render();
+}
+
 function render() {
   fetch("data.json")
     .then((response) => {
@@ -346,6 +413,7 @@ function render() {
       const asnTable = requireObject(data, "asn_table");
       const prefixTable = requireObject(data, "prefix_table");
       const customUa = requireObject(data, "custom_user_agents");
+      const overlayFingerprints = requireObject(data, "overlay_fingerprints");
 
       $("generated-at").textContent = data.generated_at
         ? `Generated ${new Date(data.generated_at).toLocaleString()}`
@@ -435,11 +503,11 @@ function render() {
       renderBars($("asn-category-bars"), asnCategories.labels, asnCategories.values, asnCategories.keys);
 
       $("asn-stats").textContent = asnTable.stats
-        ? `${fmt(asnTable.stats.mapped_asns || infra.distinct_asns)} mapped ASNs; table is sorted by good routable node count`
-        : "Table is sorted by good routable node count";
-      $("asn-table").innerHTML = asnTable.rows.map((row) => `
+        ? `${fmt(asnTable.stats.mapped_asns || infra.distinct_asns)} mapped ASNs; click any header to sort`
+        : "Click any header to sort";
+      sortableTable(".asn-data-table", asnTable.rows, (row) => `
         <tr title="${escapeAttr(row.tooltip)}">
-          <th scope="row" class="mono">${escapeHtml(row.asn)}</th>
+          <th scope="row" class="mono">${countryFlag(row.country_code, row.country)}${escapeHtml(row.asn)}</th>
           <td>${escapeHtml(row.name)}</td>
           <td>${escapeHtml(row.category)}</td>
           <td class="num">${fmt(row.total)}</td>
@@ -450,15 +518,15 @@ function render() {
           <td class="num">${fmt(row.distinct_fingerprints)}</td>
           <td class="num">${pct(row.dominant_fingerprint_share)}</td>
         </tr>
-      `).join("");
+      `);
 
       $("prefix-stats").textContent = prefixTable.stats
-        ? `${fmt(prefixTable.stats.distinct_prefixes || infra.distinct_prefixes)} routable prefixes; table is sorted by good node count. Fingerprints are distinct combinations of reported user agent, service flags, and protocol version; dominant fingerprint is the share matching the most common combination in that prefix.`
-        : "Table is sorted by good node count. Fingerprints combine reported user agent, service flags, and protocol version; dominant fingerprint is the share matching the most common combination in that prefix.";
-      $("prefix-table").innerHTML = prefixTable.rows.map((row) => `
+        ? `${fmt(prefixTable.stats.distinct_prefixes || infra.distinct_prefixes)} routable prefixes; click any header to sort. Fingerprints are distinct combinations of reported user agent, service flags, and protocol version; dominant fingerprint is the share matching the most common combination in that prefix.`
+        : "Click any header to sort. Fingerprints combine reported user agent, service flags, and protocol version; dominant fingerprint is the share matching the most common combination in that prefix.";
+      sortableTable(".prefix-data-table", prefixTable.rows, (row) => `
         <tr title="${escapeAttr(row.asn_tooltip)}">
           <th scope="row" class="mono">${escapeHtml(row.prefix)}</th>
-          <td class="mono">${escapeHtml(row.asn)}</td>
+          <td class="mono">${countryFlag(row.asn_country_code, row.asn_country)}${escapeHtml(row.asn)}</td>
           <td>${escapeHtml(row.asn_name)}</td>
           <td>${escapeHtml(row.asn_category)}</td>
           <td class="num">${fmt(row.total)}</td>
@@ -466,6 +534,17 @@ function render() {
           <td class="num">${fmt(row.other)}</td>
           <td class="num">${fmt(row.distinct_fingerprints)}</td>
           <td class="num">${pct(row.dominant_fingerprint_share)}</td>
+        </tr>
+      `);
+
+      $("overlay-fingerprint-table").innerHTML = overlayFingerprints.rows.map((row) => `
+        <tr>
+          <th scope="row">${escapeHtml(row.network)}</th>
+          <td class="num">${fmt(row.contacted)}</td>
+          <td class="num">${fmt(row.good)}</td>
+          <td class="num">${fmt(row.distinct_contacted_fingerprints)}</td>
+          <td class="num">${fmt(row.distinct_good_fingerprints)}</td>
+          <td class="num">${pct(row.dominant_good_fingerprint_share)}</td>
         </tr>
       `).join("");
 

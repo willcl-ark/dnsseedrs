@@ -389,6 +389,32 @@ thead th {
   white-space: nowrap;
 }
 
+.sort-button {
+  width: 100%;
+  border: 0;
+  padding: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: inherit;
+  cursor: pointer;
+}
+
+.sort-button:hover,
+.sort-button:focus-visible {
+  color: var(--text);
+}
+
+.sort-indicator {
+  color: var(--cyan);
+}
+
+.country-flag {
+  display: inline-block;
+  margin-right: 6px;
+  font-family: "Apple Color Emoji", "Segoe UI Emoji", sans-serif;
+}
+
 tbody tr:last-child th,
 tbody tr:last-child td {
   border-bottom: 0;

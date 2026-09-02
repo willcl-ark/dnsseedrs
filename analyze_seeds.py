@@ -214,11 +214,13 @@ def load_asn_metadata(path: Path) -> dict[str, dict]:
             handle = row_metadata.get("handle")
             category = row_metadata.get("category")
             country = row_metadata.get("country")
+            country_code = row_metadata.get("countryCode")
             network_role = row_metadata.get("networkRole")
             metadata[f"AS{asn}"] = {
                 "name": description or handle or f"AS{asn}",
                 "category": category,
                 "country": country,
+                "country_code": country_code,
                 "network_role": network_role,
             }
 
@@ -270,6 +272,7 @@ def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> 
                 "name": None,
                 "category": None,
                 "country": None,
+                "country_code": None,
                 "network_role": None,
                 "tooltip": "ASN unknown",
             }
@@ -277,6 +280,7 @@ def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> 
         name = metadata.get("name") or asn
         category = metadata.get("category")
         country = metadata.get("country")
+        country_code = metadata.get("country_code")
         network_role = metadata.get("network_role")
         parts = [f"{asn} - {name}"]
         if category:
@@ -289,6 +293,7 @@ def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> 
             "name": name,
             "category": category,
             "country": country,
+            "country_code": country_code,
             "network_role": network_role,
             "tooltip": "\n".join(parts),
         }
@@ -465,6 +470,8 @@ def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> 
                 "asn": asn,
                 "asn_name": info["name"],
                 "asn_category": info["category"],
+                "asn_country": info["country"],
+                "asn_country_code": info["country_code"],
                 "asn_tooltip": info["tooltip"],
                 "total": prefix_totals[prefix],
                 "core": prefix_by_class[prefix].get("core", 0),
@@ -507,6 +514,8 @@ def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> 
                 "asn": asn,
                 "name": info["name"],
                 "category": info["category"],
+                "country": info["country"],
+                "country_code": info["country_code"],
                 "tooltip": info["tooltip"],
                 "total": asn_totals[asn],
                 "core": asn_by_class[asn].get("core", 0),
@@ -550,6 +559,35 @@ def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> 
         for ua, count in custom_ua.most_common()
         if count > 1
     ]
+
+    overlay_fingerprint_rows = []
+    for network, label in [("tor", "Tor"), ("i2p", "I2P")]:
+        contacted_network_rows = [
+            r for r in contacted_rows if classify_network(r["address"]) == network
+        ]
+        good_network_rows = [
+            r for r in good_rows if classify_network(r["address"]) == network
+        ]
+        contacted_fingerprints = {
+            (r["user_agent"], r["services"], r["protocol_version"])
+            for r in contacted_network_rows
+        }
+        good_fingerprints = Counter(
+            (r["user_agent"], r["services"], r["protocol_version"])
+            for r in good_network_rows
+        )
+        overlay_fingerprint_rows.append(
+            {
+                "network": label,
+                "contacted": len(contacted_network_rows),
+                "good": len(good_network_rows),
+                "distinct_contacted_fingerprints": len(contacted_fingerprints),
+                "distinct_good_fingerprints": len(good_fingerprints),
+                "dominant_good_fingerprint_share": percentage(
+                    max(good_fingerprints.values(), default=0), len(good_network_rows)
+                ),
+            }
+        )
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -642,6 +680,7 @@ def build_data(rows: list[dict], asmap: dict, asn_metadata: dict[str, dict]) -> 
             "total": sum(custom_ua.values()),
             "distinct": len(custom_ua),
         },
+        "overlay_fingerprints": {"rows": overlay_fingerprint_rows},
     }
 
 
