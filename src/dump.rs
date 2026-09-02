@@ -1,14 +1,50 @@
 use crate::common::{is_good, NodeInfo};
 use crate::db::{node_info_from_row, open_db_connection, NODE_SELECT_COLUMNS};
 
-use std::{path::Path, time::Instant};
+use std::{
+    path::Path,
+    time::Instant,
+    time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
+};
 
 use async_compression::tokio::write::GzipEncoder;
 use bitcoin::network::Network;
 use log::{debug, info, warn};
-use tokio::fs::{rename, File};
+use tokio::fs::{metadata, rename, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{sleep, Duration};
+
+const GZIP_ARCHIVE_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
+
+fn archive_date(time: SystemTime) -> String {
+    let days = time.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 / 86_400;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let month_part = (5 * doy + 2) / 153;
+    let day = doy - (153 * month_part + 2) / 5 + 1;
+    let month = month_part + if month_part < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+async fn rotate_gzip_archive(gz_path: &Path) {
+    let modified = match metadata(gz_path).await {
+        Ok(metadata) => metadata.modified().unwrap(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => panic!("Failed to stat {}: {error}", gz_path.display()),
+    };
+    if modified.elapsed().unwrap_or_default() < GZIP_ARCHIVE_INTERVAL {
+        return;
+    }
+
+    let archive_path = format!("{}.{}", gz_path.display(), archive_date(modified));
+    info!("Archiving {} as {}", gz_path.display(), archive_path);
+    rename(gz_path, archive_path).await.unwrap();
+}
 
 pub async fn dumper_thread(db_file: &str, dump_file: &str, chain: &Network) {
     let db_conn = open_db_connection(db_file);
@@ -119,11 +155,24 @@ pub async fn dumper_thread(db_file: &str, dump_file: &str, chain: &Network) {
         }
         enc.shutdown().await.unwrap();
 
+        rotate_gzip_archive(archive_path).await;
         rename(gz_tmp_path, archive_path).await.unwrap();
         info!(
             "Finished writing {} in {:?}",
             archive_path.display(),
             gz_start.elapsed()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::archive_date;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn archive_date_formats_utc_date() {
+        let time = UNIX_EPOCH + Duration::from_secs(1_735_689_600);
+        assert_eq!(archive_date(time), "2025-01-01");
     }
 }
