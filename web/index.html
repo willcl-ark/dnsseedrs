@@ -381,7 +381,10 @@ function renderUaPie(target, labels, counts) {
     target.classList.toggle("ua-pie-active", index != null);
     items.forEach((entry) => entry.classList.toggle("ua-highlight", entry.dataset.uaIndex === index));
   }
-  target.onpointerover = (event) => highlight(event.target);
+  target.onpointerover = (event) => {
+    const item = event.target.closest("[data-ua-index]");
+    if (item) highlight(item);
+  };
   target.onpointerleave = () => highlight(target.contains(document.activeElement) ? document.activeElement : null);
   target.addEventListener("focusin", (event) => highlight(event.target));
   target.addEventListener("focusout", (event) => {
