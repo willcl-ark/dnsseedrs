@@ -356,6 +356,21 @@ main {
   justify-self: center;
 }
 
+.ua-pie path {
+  stroke: var(--panel);
+  stroke-width: 0.25;
+}
+
+.ua-pie-active path:not(.ua-highlight) {
+  opacity: 0.25;
+}
+
+.ua-pie-legend .ua-highlight {
+  background: var(--panel-soft);
+  outline: 1px solid var(--muted);
+  border-radius: 2px;
+}
+
 .ua-pie-legend {
   display: grid;
   gap: 8px;

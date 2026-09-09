@@ -142,7 +142,7 @@
       </div>
       <div class="ua-pie-block">
         <h3 id="ua-pie-title">Good nodes by user agent</h3>
-        <p class="note">Share of the good nodes in the top user agents listed below.</p>
+        <p class="note">Share of the good nodes in the top user agents listed below. Hover a slice for details, or hover or focus a legend entry to highlight it.</p>
         <div id="top-ua-pie" class="ua-pie-layout"></div>
       </div>
       <div class="two-column">
@@ -323,7 +323,8 @@ function renderBars(target, labels, values, keys, options = {}) {
     const value = values[i] || 0;
     const width = max ? (value / max * 100).toFixed(2) : 0;
     const detail = options.detail ? options.detail(i) : fmt(value);
-    const color = keys && keys[i] ? barColor(keys[i]) : palette[i % palette.length];
+    const color = options.color ? options.color(i)
+      : keys && keys[i] ? barColor(keys[i]) : palette[i % palette.length];
     return `<div class="bar-row">
       <div class="bar-meta">
         <span title="${escapeAttr(label)}">${escapeHtml(label)}</span>
@@ -336,6 +337,10 @@ function renderBars(target, labels, values, keys, options = {}) {
   }).join("");
 }
 
+function uaColor(index) {
+  return `hsl(${(index * 137.508) % 360} 65% 65%)`;
+}
+
 function renderUaPie(target, labels, counts) {
   const total = counts.reduce((sum, count) => sum + count, 0);
   if (!total) {
@@ -343,21 +348,45 @@ function renderUaPie(target, labels, counts) {
     return;
   }
   let cumulative = 0;
-  const stops = [];
+  const slices = [];
+  const point = (fraction) => {
+    const angle = fraction * 2 * Math.PI - Math.PI / 2;
+    return `${100 + 99 * Math.cos(angle)},${100 + 99 * Math.sin(angle)}`;
+  };
   const legend = labels.map((label, i) => {
-    const color = `hsl(${(i * 137.508) % 360} 65% 65%)`;
-    const start = cumulative / total * 100;
+    const color = uaColor(i);
+    const start = cumulative / total;
     cumulative += counts[i];
-    stops.push(`${color} ${start}% ${cumulative / total * 100}%`);
-    return `<li>
+    const end = cumulative / total;
+    const detail = `${label}: ${fmt(counts[i])} nodes, ${pct(counts[i] / total * 100)}`;
+    if (counts[i] > 0) {
+      slices.push(`<path data-ua-index="${i}" fill="${color}"
+        d="M100,100 L${point(start)} A99,99 0 0,1 ${point((start + end) / 2)} A99,99 0 0,1 ${point(end)} Z">
+        <title>${escapeHtml(detail)}</title>
+      </path>`);
+    }
+    return `<li data-ua-index="${i}" tabindex="0">
       <span class="ua-pie-swatch" style="background:${color}" aria-hidden="true"></span>
       <span class="mono">${escapeHtml(label)}</span>
       <strong>${fmt(counts[i])} <span class="note">${pct(counts[i] / total * 100)}</span></strong>
     </li>`;
   }).join("");
-  target.innerHTML = `<div class="ua-pie" role="img" aria-labelledby="ua-pie-title" aria-describedby="ua-pie-legend"
-    style="background:conic-gradient(${stops.join(",")})"></div>
+  target.innerHTML = `<svg class="ua-pie" viewBox="0 0 200 200" role="img" aria-labelledby="ua-pie-title" aria-describedby="ua-pie-legend">
+      ${slices.join("")}
+    </svg>
     <ul id="ua-pie-legend" class="ua-pie-legend">${legend}</ul>`;
+  const items = [...target.querySelectorAll("[data-ua-index]")];
+  function highlight(item) {
+    const index = item?.closest("[data-ua-index]")?.dataset.uaIndex;
+    target.classList.toggle("ua-pie-active", index != null);
+    items.forEach((entry) => entry.classList.toggle("ua-highlight", entry.dataset.uaIndex === index));
+  }
+  target.onpointerover = (event) => highlight(event.target);
+  target.onpointerleave = () => highlight(target.contains(document.activeElement) ? document.activeElement : null);
+  target.addEventListener("focusin", (event) => highlight(event.target));
+  target.addEventListener("focusout", (event) => {
+    highlight(event.relatedTarget && target.contains(event.relatedTarget) ? event.relatedTarget : null);
+  });
 }
 
 function escapeHtml(value) {
@@ -509,7 +538,7 @@ function render() {
         { detail: (i) => `${fmt(services.items[i].count)} (${pct(services.items[i].pct)})` },
       );
 
-      renderBars($("top-ua-bars"), topUa.labels, topUa.counts, topUa.keys || []);
+      renderBars($("top-ua-bars"), topUa.labels, topUa.counts, topUa.keys || [], { color: uaColor });
       renderUaPie($("top-ua-pie"), topUa.labels, topUa.counts);
 
       $("custom-ua-stats").textContent =
