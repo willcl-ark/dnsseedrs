@@ -357,8 +357,8 @@ main {
 }
 
 .ua-pie path {
-  stroke: var(--panel);
-  stroke-width: 0.25;
+  stroke: rgb(20 27 36 / 40%);
+  stroke-width: 0.15;
 }
 
 .ua-pie-active path:not(.ua-highlight) {
