@@ -140,6 +140,11 @@
           <p>Bitcoin Core versus Other, top reported user agents, and custom user-agent detail.</p>
         </div>
       </div>
+      <div class="ua-pie-block">
+        <h3 id="ua-pie-title">Good nodes by user agent</h3>
+        <p class="note">Share of the good nodes in the top user agents listed below.</p>
+        <div id="top-ua-pie" class="ua-pie-layout"></div>
+      </div>
       <div class="two-column">
         <div>
           <h3>Good nodes by user agent</h3>
@@ -331,6 +336,30 @@ function renderBars(target, labels, values, keys, options = {}) {
   }).join("");
 }
 
+function renderUaPie(target, labels, counts) {
+  const total = counts.reduce((sum, count) => sum + count, 0);
+  if (!total) {
+    target.innerHTML = '<p class="note">No good nodes to display.</p>';
+    return;
+  }
+  let cumulative = 0;
+  const stops = [];
+  const legend = labels.map((label, i) => {
+    const color = `hsl(${(i * 137.508) % 360} 65% 65%)`;
+    const start = cumulative / total * 100;
+    cumulative += counts[i];
+    stops.push(`${color} ${start}% ${cumulative / total * 100}%`);
+    return `<li>
+      <span class="ua-pie-swatch" style="background:${color}" aria-hidden="true"></span>
+      <span class="mono">${escapeHtml(label)}</span>
+      <strong>${fmt(counts[i])} <span class="note">${pct(counts[i] / total * 100)}</span></strong>
+    </li>`;
+  }).join("");
+  target.innerHTML = `<div class="ua-pie" role="img" aria-labelledby="ua-pie-title" aria-describedby="ua-pie-legend"
+    style="background:conic-gradient(${stops.join(",")})"></div>
+    <ul id="ua-pie-legend" class="ua-pie-legend">${legend}</ul>`;
+}
+
 function escapeHtml(value) {
   return text(value, "").replace(/[&<>"']/g, (c) => ({
     "&": "&amp;",
@@ -481,6 +510,7 @@ function render() {
       );
 
       renderBars($("top-ua-bars"), topUa.labels, topUa.counts, topUa.keys || []);
+      renderUaPie($("top-ua-pie"), topUa.labels, topUa.counts);
 
       $("custom-ua-stats").textContent =
         `${fmt(customUa.total)} contacted nodes across ${fmt(customUa.distinct)} distinct custom user agents`;

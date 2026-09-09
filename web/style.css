@@ -336,6 +336,56 @@ main {
   border-radius: 8px;
 }
 
+.ua-pie-block {
+  margin-bottom: 28px;
+}
+
+.ua-pie-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 28px;
+  margin-top: 18px;
+}
+
+.ua-pie {
+  width: 100%;
+  max-width: 620px;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  justify-self: center;
+}
+
+.ua-pie-legend {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ua-pie-legend li {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.ua-pie-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+}
+
+.ua-pie-legend .mono {
+  overflow-wrap: anywhere;
+}
+
+.ua-pie-legend strong {
+  text-align: right;
+  white-space: nowrap;
+}
+
 table {
   width: 100%;
   min-width: 640px;
@@ -483,6 +533,7 @@ tbody tr:hover {
 @media (max-width: 1000px) {
   .site-header,
   .method-note,
+  .ua-pie-layout,
   .two-column {
     grid-template-columns: 1fr;
   }
