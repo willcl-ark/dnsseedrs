@@ -146,7 +146,7 @@ pub fn parse_address(addr: &str) -> Result<NodeAddress, &'static str> {
                 || ip4.is_link_local()
                 || (ip4.octets()[0] == 192 && ip4.octets()[1] == 0 && ip4.octets()[2] == 0)
                 || ip4.is_documentation()
-                || ip4.is_broadcast()
+                || ip4.octets()[0] >= 240
             {
                 debug!("{} is not globally accessible", ip4);
                 return Err("IPv4 addresses must be globally accessible");
@@ -293,4 +293,28 @@ pub struct NetStatus {
 pub enum BindProtocol {
     Udp,
     Tcp,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_address;
+
+    #[test]
+    fn reject_reserved_ipv4() {
+        for ip in [
+            "240.0.0.0",
+            "240.0.0.1",
+            "250.1.2.3",
+            "255.255.255.254",
+            "255.255.255.255",
+        ] {
+            assert!(parse_address(&format!("{ip}:8333")).is_err(), "{ip}");
+            assert!(
+                parse_address(&format!("[::ffff:{ip}]:8333")).is_err(),
+                "{ip}"
+            );
+        }
+        assert!(parse_address("8.8.8.8:8333").is_ok());
+        assert!(parse_address("[::ffff:8.8.8.8]:8333").is_ok());
+    }
 }
