@@ -48,7 +48,7 @@ const MAX_ONION_CONCURRENCY: usize = 16;
 const MAX_I2P_CONCURRENCY: usize = 8;
 const LEASED_QUEUE_MULTIPLIER: usize = 8;
 const LEASED_QUEUE_LOW_WATERMARK_DIVISOR: usize = 4;
-const SOCKS5_TIMEOUT: time::Duration = time::Duration::from_secs(10);
+const SOCKS5_TIMEOUT: time::Duration = time::Duration::from_secs(60);
 
 #[derive(Clone, Copy)]
 enum CrawlBucket {
