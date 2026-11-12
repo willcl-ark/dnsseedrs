@@ -3,8 +3,11 @@ use std::{
     str::FromStr,
 };
 
+use base32ct::{Base32Unpadded, Encoding};
 use bitcoin::{network::Network, p2p::ServiceFlags};
+use curve25519_dalek::{edwards::CompressedEdwardsY, traits::IsIdentity};
 use log::debug;
+use sha3::{Digest, Sha3_256};
 
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -206,6 +209,25 @@ pub fn parse_address(addr: &str) -> Result<NodeAddress, &'static str> {
     let host = &sp[0];
     let port = sp[1].parse::<u16>().unwrap();
     if host.len() == 62 && host.ends_with(".onion") {
+        let decoded = Base32Unpadded::decode_vec(&host[..56].to_ascii_lowercase())
+            .map_err(|_| "Invalid onion encoding")?;
+        if decoded[34] != 3 {
+            return Err("Invalid onion version");
+        }
+        let checksum = Sha3_256::new()
+            .chain_update(b".onion checksum")
+            .chain_update(&decoded[..32])
+            .chain_update([3])
+            .finalize();
+        if decoded[32..34] != checksum[..2] {
+            return Err("Invalid onion checksum");
+        }
+        let key = CompressedEdwardsY(decoded[..32].try_into().unwrap());
+        let point = key.decompress().ok_or("Invalid onion public key")?;
+        // Tor requires a nonidentity point in the prime-order subgroup.
+        if point.compress() != key || point.is_identity() || !point.is_torsion_free() {
+            return Err("Invalid onion public key");
+        }
         return Ok(NodeAddress {
             host: Host::OnionV3(host.to_string()),
             port,
@@ -298,6 +320,52 @@ pub enum BindProtocol {
 #[cfg(test)]
 mod tests {
     use super::parse_address;
+    use base32ct::{Base32Unpadded, Encoding};
+    use curve25519_dalek::constants::{ED25519_BASEPOINT_POINT, EIGHT_TORSION};
+    use sha3::{Digest, Sha3_256};
+
+    fn onion_address(key: [u8; 32], version: u8) -> String {
+        let checksum = Sha3_256::new()
+            .chain_update(b".onion checksum")
+            .chain_update(key)
+            .chain_update([version])
+            .finalize();
+        let mut address = key.to_vec();
+        address.extend_from_slice(&checksum[..2]);
+        address.push(version);
+        format!("{}.onion:8333", Base32Unpadded::encode_string(&address))
+    }
+
+    #[test]
+    fn validate_onion_envelope() {
+        let valid = "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion:8333";
+        assert!(parse_address(valid).is_ok());
+        let uppercase = format!("{}.onion:8333", valid[..56].to_ascii_uppercase());
+        assert!(parse_address(&uppercase).is_ok());
+        assert!(parse_address(&valid.replacen('d', "!", 1)).is_err());
+        assert!(parse_address(&valid.replacen('d', "e", 1)).is_err());
+        let decoded = Base32Unpadded::decode_vec(&valid[..56]).unwrap();
+        let key = decoded[..32].try_into().unwrap();
+        assert!(parse_address(&onion_address(key, 3)).is_ok());
+        assert!(parse_address(&onion_address(key, 2)).is_err());
+    }
+
+    #[test]
+    fn reject_invalid_onion_keys_with_valid_checksums() {
+        let mut identity = [0; 32];
+        identity[0] = 1;
+        let mixed_order = (ED25519_BASEPOINT_POINT + EIGHT_TORSION[1])
+            .compress()
+            .to_bytes();
+        // y = p + 1 is a noncanonical encoding of the identity.
+        let mut noncanonical = [0xff; 32];
+        noncanonical[0] = 0xee;
+        noncanonical[31] = 0x7f;
+        for key in [[0; 32], identity, [2; 32], noncanonical, mixed_order] {
+            let address = onion_address(key, 3);
+            assert!(parse_address(&address).is_err(), "{address}");
+        }
+    }
 
     #[test]
     fn reject_reserved_ipv4() {

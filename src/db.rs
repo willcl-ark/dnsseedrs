@@ -271,14 +271,20 @@ mod tests {
             [],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO nodes VALUES(
-                'duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion:8333',
-                100, 0, '', x'0000000000000000', 0, 0, 3, 0.0, 0.0, 0.0, 0.0, 0.0
-            )",
-            [],
-        )
-        .unwrap();
+        for address in [
+            "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion:8333",
+            // All-zero public key, with a valid v3 checksum.
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaam2dqd.onion:8333",
+        ] {
+            conn.execute(
+                "INSERT INTO nodes VALUES(
+                    ?, 100, 0, '', x'0000000000000000', 0, 0, 3,
+                    0.0, 0.0, 0.0, 0.0, 0.0
+                )",
+                [address],
+            )
+            .unwrap();
+        }
         conn.execute(
             "CREATE INDEX idx_nodes_last_tried_address ON nodes(last_tried, address)",
             [],

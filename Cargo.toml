@@ -12,6 +12,7 @@ base64ct = { version = "~1.6.0", features = ["alloc"] }
 bip324 = { version = "0.10.0", features = ["tokio"] }
 bitcoin = "0.32.6"
 clap = { version = "4.5.1", features = ["derive"] }
+curve25519-dalek = { version = "4.1.3", default-features = false }
 domain = { version = "0.10.1", features = ["sign"] }
 env_logger = "0.11.8"
 log = "0.4.28"
